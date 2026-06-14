@@ -1,0 +1,12 @@
+---
+description: "Repo-local caveman terse mode, Russian-aware, no Claude hooks"
+alwaysApply: true
+---
+
+Read `.agents/integrations/caveman.md`. Use repo-local caveman skills from
+`.agents/skills/` when relevant. Do not run broad upstream installers or write
+global Claude config unless the user explicitly asks.
+
+For Russian-language prompts, answer in Russian with terse technical prose.
+Keep code, paths, commands, URLs, identifiers, and exact error strings unchanged.
+Use normal prose when compression risks ambiguity.

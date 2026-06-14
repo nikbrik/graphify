@@ -5,6 +5,8 @@ Read that file before making architecture, codebase, or workflow decisions.
 
 Rules:
 - Treat `.agents/project-spec.md` as the source of truth for project-specific agent guidance.
+- For source-level code navigation, also read `.agents/integrations/ast-index.md` and prefer `ast-index` before broad raw text search when an index is available.
+- For terse multi-agent communication and repo-local caveman skills, read `.agents/integrations/caveman.md`.
 - If `graphify-out/graph.json` exists, use `graphify query`, `graphify path`, or `graphify explain` before broad raw-file searches for codebase questions.
 - If `graphify-out/wiki/index.md` exists, use it for broad navigation instead of raw source browsing.
 - If `graphify-out/graph.json` does not exist, do not try to read `graphify-out/GRAPH_REPORT.md`; use `README.md`, `ARCHITECTURE.md`, `pyproject.toml`, CI config, and `rg`.

@@ -30,6 +30,19 @@ Important subsystems:
 - Host install and CLI orchestration: `graphify/__main__.py`, `graphify/hooks.py`
 - Skill generation source: `tools/skillgen/fragments/`, `tools/skillgen/platforms.toml`, `tools/skillgen/gen.py`
 
+## Agent Integrations
+
+Repo-local agent integrations live under `.agents/`:
+
+- ast-index structural search: `.agents/integrations/ast-index.md`
+- caveman terse communication and cavecrew presets: `.agents/integrations/caveman.md`
+- canonical skills: `.agents/skills/`
+- subagent presets: `.agents/agents/`
+
+Platform-specific files must remain thin adapters back to `.agents`. Do not run
+upstream installers that write global agent config unless the user explicitly
+asks for a global install.
+
 ## Development Workflow
 
 Use `uv` for local development:

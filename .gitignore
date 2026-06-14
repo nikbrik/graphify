@@ -18,6 +18,12 @@ graphify-out/
 .graphify_python
 .claude/
 skills/
+!.agents/
+!.agents/**
+.agents/**/__pycache__/
+.agents/**/*.pyc
+!.codex/
+!.codex/**
 # The packaged skill bundles under graphify/skills/ are generated, committed
 # artifacts (rendered by tools/skillgen). Keep them tracked even though the
 # broad skills/ rule above ignores install-target skill dirs elsewhere.
