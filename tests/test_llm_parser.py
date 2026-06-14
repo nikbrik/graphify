@@ -95,6 +95,18 @@ def test_parse_result_distinguishes_valid_empty_from_invalid_json():
     assert invalid.data == {"nodes": [], "edges": [], "hyperedges": []}
 
 
+def test_looks_like_truncated_json_detects_unclosed_object():
+    assert llm._looks_like_truncated_json('{"nodes": [{"id": "a"}')
+    assert llm._looks_like_truncated_json('```json\n{"nodes": [\n')
+    assert not llm._looks_like_truncated_json('{"nodes": [], "edges": []}')
+    assert not llm._looks_like_truncated_json("I cannot extract structured data.")
+
+
+def test_parse_result_log_on_failure_can_be_suppressed(capsys):
+    llm._parse_llm_json_result('{"nodes": [{"id":', log_on_failure=False)
+    assert capsys.readouterr().err == ""
+
+
 # ---------- _call_claude_cli: argv shape ----------
 
 

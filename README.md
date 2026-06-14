@@ -648,6 +648,17 @@ OPENROUTER_API_KEY=... graphify extract . --backend openrouter
 
 `--require-parameters` stores `extra_body.provider.require_parameters=true`, which helps avoid silent routing to providers that ignore structured-output parameters. `--response-healing` stores `extra_body.plugins=[{"id":"response-healing"}]`. OpenRouter structured outputs still require a compatible model/provider; use `--response-format json_object` or `off` if a provider rejects schema mode.
 
+For cheaper or smaller models (e.g. `deepseek/deepseek-v4-flash`) on doc-heavy corpora (many `.md` / `.agents/spec/` files), graphify automatically caps chunk size by estimated output tokens and uses a compact extraction prompt. You can tune further:
+
+```bash
+# Recommended for deepseek-v4-flash on large doc trees
+export GRAPHIFY_MAX_OUTPUT_TOKENS=16384
+graphify extract . --backend openrouter --model deepseek/deepseek-v4-flash \
+  --token-budget 6000 --max-files-per-chunk 6 --max-concurrency 2
+```
+
+`GRAPHIFY_MAX_OUTPUT_TOKENS` raises the per-request output cap (default follows the backend, typically 16384). `--token-budget` limits input tokens per chunk; `--max-files-per-chunk` overrides the default file cap (8 docs / 20 code).
+
 ---
 
 ## Learn more

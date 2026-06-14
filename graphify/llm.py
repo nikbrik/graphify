@@ -398,12 +398,42 @@ dependencies visible in the sources). Avoid broad conceptual similarity edges.
 Mark uncertain ones AMBIGUOUS instead of omitting.
 """
 
+_COMPACT_EXTRACTION_SUFFIX = """\
 
-def _extraction_system(*, deep: bool = False) -> str:
-    """Return the semantic-extraction system prompt, optionally in deep mode."""
-    if not deep:
-        return _EXTRACTION_SYSTEM
-    return _EXTRACTION_SYSTEM + _DEEP_EXTRACTION_SUFFIX
+COMPACT_MODE (weak model):
+- Doc/paper: one primary node per source file (file_type=document). At most 2
+  extra concept nodes per file, only if explicitly named in text.
+- hyperedges: [] unless 3+ files share one named concept with explicit
+  cross-references.
+- Output minified JSON on one line. No pretty-printing.
+- Prefer fewer edges; skip semantically_similar_to unless obvious.
+"""
+
+_COMPACT_MODEL_FRAGMENTS = (
+    "flash",
+    "mini",
+    "7b",
+    "8b",
+    "lite",
+    "nano",
+    "haiku",
+)
+
+
+def _is_compact_model(model: str) -> bool:
+    """Heuristic: smaller/cheaper models need shorter outputs to avoid truncation."""
+    name = (model or "").lower()
+    return any(fragment in name for fragment in _COMPACT_MODEL_FRAGMENTS)
+
+
+def _extraction_system(*, deep: bool = False, compact: bool = False) -> str:
+    """Return the semantic-extraction system prompt, optionally in deep/compact mode."""
+    prompt = _EXTRACTION_SYSTEM
+    if compact:
+        prompt += _COMPACT_EXTRACTION_SUFFIX
+    if deep:
+        prompt += _DEEP_EXTRACTION_SUFFIX
+    return prompt
 
 
 _GRAPHIFY_EXTRACTION_JSON_SCHEMA: dict = {
@@ -565,7 +595,10 @@ def _response_format_payload(config) -> dict | None:
     )
 
 
-def _default_response_format_for_backend(backend: str) -> str | None:
+def _default_response_format_for_backend(
+    backend: str,
+    model: str | None = None,
+) -> str | None:
     """Default JSON mode for API backends where fallback is cheap.
 
     Ollama is excluded: unsupported-parameter retries on local models can be
@@ -574,6 +607,12 @@ def _default_response_format_for_backend(backend: str) -> str | None:
     if backend == "ollama":
         return None
     return "json_object"
+
+
+def _resolve_max_output_tokens(cfg: dict) -> int:
+    """Return the backend's max output tokens, honouring env override."""
+    raw = cfg.get("max_completion_tokens") or cfg.get("max_tokens", 8192)
+    return _resolve_max_tokens(raw)
 
 
 def _looks_like_response_format_unsupported(exc: BaseException) -> bool:
@@ -902,7 +941,53 @@ def _empty_fragment() -> dict:
     return {"nodes": [], "edges": [], "hyperedges": []}
 
 
-def _parse_llm_json_result(raw: str) -> _LLMJsonParseResult:
+def _json_candidate_text(raw: str) -> str:
+    """Strip optional markdown fences, returning the JSON body candidate."""
+    stripped = raw.strip()
+    fence_start = stripped.find("```")
+    if fence_start != -1:
+        after_fence = stripped[fence_start + 3 :]
+        nl = after_fence.find("\n")
+        if nl != -1 and after_fence[:nl].strip().lower() in {"json", "javascript", "js", ""}:
+            after_fence = after_fence[nl + 1 :]
+        fence_end = after_fence.rfind("```")
+        if fence_end != -1:
+            stripped = after_fence[:fence_end].strip()
+        else:
+            stripped = after_fence.strip()
+    return stripped
+
+
+def _looks_like_truncated_json(raw: str) -> bool:
+    """True when the response looks like JSON that was cut off mid-generation."""
+    if not raw or not raw.strip():
+        return False
+    stripped = _json_candidate_text(raw)
+    if not stripped.startswith("{"):
+        return False
+    depth = 0
+    in_string = False
+    escape = False
+    for ch in stripped:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+    return depth > 0
+
+
+def _parse_llm_json_result(raw: str, *, log_on_failure: bool = True) -> _LLMJsonParseResult:
     """Strip optional markdown fences and parse JSON with explicit status.
 
     Caps the input at `_LLM_JSON_MAX_BYTES` so a hostile or runaway model
@@ -919,19 +1004,8 @@ def _parse_llm_json_result(raw: str) -> _LLMJsonParseResult:
     # text (not only at offset 0 — the original code only stripped fences when
     # `raw.startswith("```")`, missing the common case where Claude prepends a
     # preamble like "Here's the extracted entities:\n\n```json\n{...}\n```").
-    stripped = raw.strip()
-    fence_start = stripped.find("```")
-    if fence_start != -1:
-        after_fence = stripped[fence_start + 3 :]
-        # Optional language tag (json, JSON, javascript, etc.) up to newline.
-        nl = after_fence.find("\n")
-        if nl != -1 and after_fence[:nl].strip().lower() in {"json", "javascript", "js", ""}:
-            after_fence = after_fence[nl + 1 :]
-        fence_end = after_fence.rfind("```")
-        if fence_end != -1:
-            stripped = after_fence[:fence_end].strip()
-        else:
-            stripped = after_fence.strip()
+    stripped = _json_candidate_text(raw)
+    first_error = "invalid JSON"
     try:
         parsed = json.loads(stripped)
         if isinstance(parsed, dict):
@@ -974,11 +1048,12 @@ def _parse_llm_json_result(raw: str) -> _LLMJsonParseResult:
                     except json.JSONDecodeError as exc:
                         first_error = str(exc)
                         break
-    print(
-        f"[graphify] LLM returned invalid JSON, skipping chunk "
-        f"(first 200 chars: {raw[:200]!r})",
-        file=sys.stderr,
-    )
+    if log_on_failure:
+        print(
+            f"[graphify] LLM returned invalid JSON "
+            f"(first 200 chars: {raw[:200]!r})",
+            file=sys.stderr,
+        )
     return _LLMJsonParseResult(_empty_fragment(), False, first_error)
 
 
@@ -1145,10 +1220,11 @@ def _call_openai_compat(
     # default to 600s, which is long enough for a 31B model on a 16k chunk
     # but still bounds runaway connections (issue #792 addendum).
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=_resolve_api_timeout())
+    compact = _is_compact_model(model)
     kwargs: dict = {
         "model": model,
         "messages": [
-            {"role": "system", "content": _extraction_system(deep=deep_mode)},
+            {"role": "system", "content": _extraction_system(deep=deep_mode, compact=compact)},
             {"role": "user", "content": _openai_content(user_message, images or [])},
         ],
         "max_completion_tokens": max_completion_tokens,
@@ -1157,9 +1233,14 @@ def _call_openai_compat(
         kwargs["temperature"] = temperature
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
-    effective_response_format = _response_format_payload(
-        response_format if response_format is not None else _default_response_format_for_backend(backend)
+    effective_format_config = (
+        response_format
+        if response_format is not None
+        else _default_response_format_for_backend(backend, model)
     )
+    if compact and effective_format_config == "json_schema":
+        effective_format_config = "json_object"
+    effective_response_format = _response_format_payload(effective_format_config)
     if effective_response_format is not None:
         kwargs["response_format"] = effective_response_format
     # A custom provider in providers.json can pass its own extra_body (e.g.
@@ -1221,10 +1302,13 @@ def _call_openai_compat(
     if not resp.choices or resp.choices[0].message is None:
         raise ValueError("LLM returned empty or filtered response")
     raw_content = resp.choices[0].message.content
-    parse_result = _parse_llm_json_result(raw_content or "{}")
+    parse_result = _parse_llm_json_result(raw_content or "{}", log_on_failure=False)
     input_tokens = resp.usage.prompt_tokens if resp.usage else 0
     output_tokens = resp.usage.completion_tokens if resp.usage else 0
     finish_reason = resp.choices[0].finish_reason
+    truncated_json = not parse_result.ok and _looks_like_truncated_json(raw_content or "")
+    if truncated_json and finish_reason != "length":
+        finish_reason = "length"
     if (
         _should_repair_llm_json(raw_content, parse_result)
         and finish_reason != "length"
@@ -1254,6 +1338,12 @@ def _call_openai_compat(
                 f"({repaired.error or 'unknown error'}); keeping empty fragment.",
                 file=sys.stderr,
             )
+    elif not parse_result.ok and not truncated_json:
+        print(
+            f"[graphify] LLM returned invalid JSON "
+            f"(first 200 chars: {(raw_content or '')[:200]!r})",
+            file=sys.stderr,
+        )
     result = parse_result.data
     result["input_tokens"] = input_tokens
     result["output_tokens"] = output_tokens
@@ -1633,7 +1723,7 @@ def extract_files_direct(
     image_refs = _build_image_refs(image_files, root, read_bytes=read_bytes) if image_files else []
     if image_refs and not vision:
         image_refs = _strip_pixels(image_refs)
-    max_out = _resolve_max_tokens(cfg.get("max_tokens", 8192))
+    max_out = _resolve_max_output_tokens(cfg)
 
     if backend == "claude":
         return _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
@@ -1664,13 +1754,51 @@ def extract_files_direct(
         user_msg,
         temperature=_resolve_temperature(cfg.get("temperature", 0), mdl),
         reasoning_effort=cfg.get("reasoning_effort"),
-        max_completion_tokens=_resolve_max_tokens(cfg.get("max_completion_tokens", 8192)),
+        max_completion_tokens=max_out,
         backend=backend,
         deep_mode=deep_mode,
         images=image_refs,
         extra_body=cfg.get("extra_body"),
         response_format=cfg.get("response_format"),
     )
+
+
+# Conservative per-file output estimates for chunk packing. Weak models and
+# doc-heavy corpora routinely truncate when packing only by input token budget.
+_DOC_OUTPUT_TOKEN_ESTIMATE = 700
+_IMAGE_OUTPUT_TOKEN_ESTIMATE = 300
+_CODE_OUTPUT_TOKEN_ESTIMATE = 400
+_DEFAULT_MAX_FILES_PER_DOC_CHUNK = 8
+_DEFAULT_MAX_FILES_PER_CODE_CHUNK = 20
+_OUTPUT_BUDGET_FRACTION = 0.75
+
+
+def _is_doc_or_paper(path: Path) -> bool:
+    from graphify.detect import DOC_EXTENSIONS, PAPER_EXTENSIONS
+
+    ext = path.suffix.lower()
+    return ext in DOC_EXTENSIONS or ext in PAPER_EXTENSIONS
+
+
+def _file_cap_for_packing(path: Path, max_files_per_chunk: int | None) -> int:
+    if max_files_per_chunk is not None:
+        return max_files_per_chunk
+    if _is_doc_or_paper(path):
+        return _DEFAULT_MAX_FILES_PER_DOC_CHUNK
+    return _DEFAULT_MAX_FILES_PER_CODE_CHUNK
+
+
+def _estimate_output_tokens(path: Path) -> int:
+    if _is_vision_image(path):
+        return _IMAGE_OUTPUT_TOKEN_ESTIMATE
+    if _is_doc_or_paper(path):
+        return _DOC_OUTPUT_TOKEN_ESTIMATE
+    return _CODE_OUTPUT_TOKEN_ESTIMATE
+
+
+def _default_output_token_budget(backend: str) -> int:
+    cfg = BACKENDS.get(backend, {})
+    return int(_resolve_max_output_tokens(cfg) * _OUTPUT_BUDGET_FRACTION)
 
 
 def _estimate_file_tokens(path: Path) -> int:
@@ -1704,6 +1832,9 @@ def _estimate_file_tokens(path: Path) -> int:
 def _pack_chunks_by_tokens(
     files: list[Path],
     token_budget: int,
+    *,
+    output_token_budget: int | None = None,
+    max_files_per_chunk: int | None = None,
 ) -> list[list[Path]]:
     """Greedily pack files into chunks that fit a token budget.
 
@@ -1711,7 +1842,8 @@ def _pack_chunks_by_tokens(
     chunk (cross-file edges are more likely to be extracted within a chunk
     than across chunks). Within each directory, files are added one at a
     time; a chunk is closed when adding the next file would exceed the
-    budget. A single file larger than the budget gets its own chunk and the
+    input budget, the estimated output budget, or the per-chunk file cap.
+    A single file larger than the budget gets its own chunk and the
     caller is expected to handle the API error if it actually overflows the
     model's context window — packing can't shrink one big file.
     """
@@ -1725,21 +1857,31 @@ def _pack_chunks_by_tokens(
     chunks: list[list[Path]] = []
     current: list[Path] = []
     current_tokens = 0
+    current_output_tokens = 0
     current_images = 0
 
     for directory in sorted(by_dir):
         for path in by_dir[directory]:
             cost = _estimate_file_tokens(path)
+            output_cost = _estimate_output_tokens(path)
             is_image = _is_vision_image(path)
-            over_budget = current_tokens + cost > token_budget
+            file_cap = _file_cap_for_packing(path, max_files_per_chunk)
+            over_input = current_tokens + cost > token_budget
+            over_output = (
+                output_token_budget is not None
+                and current_output_tokens + output_cost > output_token_budget
+            )
+            over_file_count = bool(current) and len(current) >= file_cap
             over_images = is_image and current_images >= _MAX_IMAGES_PER_CHUNK
-            if current and (over_budget or over_images):
+            if current and (over_input or over_output or over_file_count or over_images):
                 chunks.append(current)
                 current = []
                 current_tokens = 0
+                current_output_tokens = 0
                 current_images = 0
             current.append(path)
             current_tokens += cost
+            current_output_tokens += output_cost
             current_images += is_image
 
     if current:
@@ -1917,6 +2059,8 @@ def extract_corpus_parallel(
     chunk_size: int = 20,
     on_chunk_done: Callable | None = None,
     token_budget: int | None = 60_000,
+    output_token_budget: int | None = None,
+    max_files_per_chunk: int | None = None,
     max_concurrency: int = 4,
     max_retry_depth: int = 3,
     deep_mode: bool = False,
@@ -1925,9 +2069,11 @@ def extract_corpus_parallel(
 
     Chunking strategy:
         - If `token_budget` is set (default 60_000), files are packed to fit
-          the budget and grouped by parent directory. This avoids the worst
-          case where 20 randomly-grouped files exceed a model's context
-          window in a single request.
+          the input budget and grouped by parent directory. Packing also
+          respects `output_token_budget` (default: 75% of the backend's max
+          output tokens) and a per-chunk file cap (8 docs/papers, 20 code).
+          This avoids the worst case where dozens of small docs fit in the
+          input window but produce JSON that exceeds max_completion_tokens.
         - If `token_budget=None`, falls back to the legacy fixed-count
           `chunk_size` packing for backwards compatibility.
 
@@ -1956,7 +2102,14 @@ def extract_corpus_parallel(
     chunk does not abort the run.
     """
     if token_budget is not None:
-        chunks = _pack_chunks_by_tokens(files, token_budget=token_budget)
+        if output_token_budget is None:
+            output_token_budget = _default_output_token_budget(backend)
+        chunks = _pack_chunks_by_tokens(
+            files,
+            token_budget=token_budget,
+            output_token_budget=output_token_budget,
+            max_files_per_chunk=max_files_per_chunk,
+        )
     else:
         chunks = [files[i:i + chunk_size] for i in range(0, len(files), chunk_size)]
 

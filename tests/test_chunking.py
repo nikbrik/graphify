@@ -105,6 +105,43 @@ def test_pack_chunks_rejects_non_positive_budget(tmp_path):
         _pack_chunks_by_tokens([f], token_budget=0)
 
 
+def test_pack_chunks_splits_many_small_docs_by_output_budget(tmp_path):
+    """Fifty tiny docs must not land in one chunk when output budget is tight."""
+    from graphify.llm import _pack_chunks_by_tokens
+
+    files = []
+    for i in range(50):
+        f = tmp_path / f"doc_{i}.md"
+        f.write_text(f"# Doc {i}\n")
+        files.append(f)
+
+    chunks = _pack_chunks_by_tokens(
+        files,
+        token_budget=1_000_000,
+        output_token_budget=4_000,
+    )
+    assert len(chunks) > 1
+    assert all(len(c) <= 8 for c in chunks)
+    assert sum(len(c) for c in chunks) == 50
+
+
+def test_pack_chunks_respects_max_files_per_chunk_override(tmp_path):
+    from graphify.llm import _pack_chunks_by_tokens
+
+    files = [tmp_path / f"d{i}.md" for i in range(10)]
+    for f in files:
+        f.write_text("x")
+
+    chunks = _pack_chunks_by_tokens(
+        files,
+        token_budget=1_000_000,
+        output_token_budget=1_000_000,
+        max_files_per_chunk=3,
+    )
+    assert all(len(c) <= 3 for c in chunks)
+    assert sum(len(c) for c in chunks) == 10
+
+
 # ---- Tokenizer fallback ------------------------------------------------------
 
 def test_estimate_file_tokens_uses_tiktoken_when_available(tmp_path):
@@ -272,9 +309,10 @@ def test_corpus_parallel_token_budget_default_packs_files(tmp_path):
     with patch("graphify.llm.extract_files_direct", side_effect=record):
         extract_corpus_parallel(files, backend="kimi", max_concurrency=1)
 
-    # 50 tiny files at default 60k token budget should pack into 1 chunk
-    assert len(chunks_seen) == 1
-    assert chunks_seen[0] == 50
+    # Output-aware packing splits by estimated output tokens and the 20-file
+    # code cap even when the input budget would fit everything in one chunk.
+    assert len(chunks_seen) >= 2
+    assert sum(chunks_seen) == 50
 
 
 # ---- Adaptive retry on truncation -------------------------------------------

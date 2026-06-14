@@ -2187,6 +2187,7 @@ def main() -> None:
         print("    --max-workers N         AST extraction subprocess count (default: cpu_count)")
         print("    --token-budget N        per-chunk token cap for semantic extraction (default: 60000)")
         print("    --max-concurrency N     parallel semantic chunks in flight (default: 4; set 1 for local LLMs)")
+        print("    --max-files-per-chunk N cap files per semantic chunk (default: 8 docs, 20 code)")
         print("    --api-timeout S         per-request timeout in seconds for the LLM client (default: 600)")
         print("    --out DIR               output dir (default: <path>); writes <DIR>/graphify-out/")
         print("    --google-workspace      export .gdoc/.gsheet/.gslides shortcuts via gws before extraction")
@@ -4008,6 +4009,7 @@ def main() -> None:
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
+                "[--max-files-per-chunk N] "
                 "[--api-timeout S] [--postgres DSN] [--cargo]",
                 file=sys.stderr,
             )
@@ -4038,6 +4040,7 @@ def main() -> None:
         cli_max_workers: int | None = None
         cli_token_budget: int | None = None
         cli_max_concurrency: int | None = None
+        cli_max_files_per_chunk: int | None = None
         cli_api_timeout: float | None = None
         # Clustering tuning knobs
         cli_resolution: float = 1.0
@@ -4108,6 +4111,10 @@ def main() -> None:
                 cli_max_concurrency = _parse_int("--max-concurrency", args[i + 1]); i += 2
             elif a.startswith("--max-concurrency="):
                 cli_max_concurrency = _parse_int("--max-concurrency", a.split("=", 1)[1]); i += 1
+            elif a == "--max-files-per-chunk" and i + 1 < len(args):
+                cli_max_files_per_chunk = _parse_int("--max-files-per-chunk", args[i + 1]); i += 2
+            elif a.startswith("--max-files-per-chunk="):
+                cli_max_files_per_chunk = _parse_int("--max-files-per-chunk", a.split("=", 1)[1]); i += 1
             elif a == "--api-timeout" and i + 1 < len(args):
                 cli_api_timeout = _parse_float("--api-timeout", args[i + 1]); i += 2
             elif a.startswith("--api-timeout="):
@@ -4364,6 +4371,8 @@ def main() -> None:
                     corpus_kwargs["token_budget"] = cli_token_budget
                 if cli_max_concurrency is not None:
                     corpus_kwargs["max_concurrency"] = cli_max_concurrency
+                if cli_max_files_per_chunk is not None:
+                    corpus_kwargs["max_files_per_chunk"] = cli_max_files_per_chunk
 
                 # Minimal progress callback so the CLI is no longer silent
                 # during long local-inference runs (issue #792 addendum).
