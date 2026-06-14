@@ -24,6 +24,12 @@ skills/
 .agents/**/*.pyc
 !.codex/
 !.codex/**
+# ast-index stores its active SQLite DB in the user cache, but keep any
+# accidental repo-local index databases out of commits.
+/.ast-index/
+/.ast-index-cache/
+/.ast-index.db
+/ast-index.db
 # The packaged skill bundles under graphify/skills/ are generated, committed
 # artifacts (rendered by tools/skillgen). Keep them tracked even though the
 # broad skills/ rule above ignores install-target skill dirs elsewhere.

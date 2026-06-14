@@ -45,7 +45,11 @@ File order, ascending line numbers within file.
 
 ## Tools
 
-`Bash` only for `git diff`/`git log -p`/`git show`. No mutating commands.
+`Bash` for `git diff`/`git log -p`/`git show` and read-only ast-index context.
+When review needs symbol/file/usage context, run `ast-index stats`, then
+`ast-index search|symbol|refs|usages|outline` before Grep. Use Grep only for
+regex, literals, comments, non-code files, or empty ast-index results. No
+mutating commands.
 
 ## Auto-clarity
 

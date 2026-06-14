@@ -5,7 +5,7 @@ Read that file before making architecture, codebase, or workflow decisions.
 
 Rules:
 - Treat `.agents/project-spec.md` as the source of truth for project-specific agent guidance.
-- For source-level code navigation, also read `.agents/integrations/ast-index.md` and prefer `ast-index` before broad raw text search when an index is available.
+- For source-level code navigation/search, also read `.agents/skills/codebase-search/SKILL.md` and `.agents/integrations/ast-index.md`; use `ast-index` before broad `rg`, grep, or host Search/Grep when an index is available or can be built.
 - For terse multi-agent communication and repo-local caveman skills, read `.agents/integrations/caveman.md`.
 - If `graphify-out/graph.json` exists, use `graphify query`, `graphify path`, or `graphify explain` before broad raw-file searches for codebase questions.
 - If `graphify-out/wiki/index.md` exists, use it for broad navigation instead of raw source browsing.

@@ -35,6 +35,7 @@ Important subsystems:
 Repo-local agent integrations live under `.agents/`:
 
 - ast-index structural search: `.agents/integrations/ast-index.md`
+- active code search trigger: `.agents/skills/codebase-search/SKILL.md`
 - caveman terse communication and cavecrew presets: `.agents/integrations/caveman.md`
 - canonical skills: `.agents/skills/`
 - subagent presets: `.agents/agents/`
@@ -42,6 +43,11 @@ Repo-local agent integrations live under `.agents/`:
 Platform-specific files must remain thin adapters back to `.agents`. Do not run
 upstream installers that write global agent config unless the user explicitly
 asks for a global install.
+
+For source-level search, symbol lookup, usage tracing, refactor impact checks,
+debugging investigations, and code review context lookup, use the
+`codebase-search` skill. It requires ast-index before broad `rg`, grep, or host
+Search/Grep when an index is available or can be built.
 
 ## Development Workflow
 

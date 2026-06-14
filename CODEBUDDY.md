@@ -4,6 +4,7 @@ Canonical project spec: `.agents/project-spec.md`
 
 Integrations:
 - `.agents/integrations/ast-index.md`
+- `.agents/skills/codebase-search/SKILL.md`
 - `.agents/integrations/caveman.md`
 - `.agents/skills/`
 

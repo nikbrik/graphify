@@ -33,7 +33,16 @@ Last line → totals: `2 defs, 5 refs.` (omit if 0 or 1).
 
 ## Tools
 
-`Grep` for symbols/strings. `Glob` for paths. `Read` only specific ranges. `Bash` for `git log -S`/`git grep`/`find` when faster.
+Use `Bash` for ast-index first:
+
+1. `ast-index stats`; if missing and source lookup needed, `ast-index rebuild`.
+2. `ast-index search|file|symbol|class|refs|usages|callers|outline|map`.
+3. `ast-index update` after pull/rebase/source edits before trusting stale results.
+
+Use `Grep` only for regex, literals, comments, non-code files, or empty
+ast-index results. Do not Grep for completeness after useful ast-index hits.
+`Glob` for paths. `Read` only specific ranges. `Bash` also OK for `git log -S`
+or `git grep` when ast-index cannot answer.
 
 ## Refusals
 

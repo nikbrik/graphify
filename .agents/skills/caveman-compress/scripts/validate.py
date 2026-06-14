@@ -170,12 +170,8 @@ def validate_inline_codes(orig, comp, result):
 # ---------- Main ----------
 
 
-def validate(original_path: Path, compressed_path: Path) -> ValidationResult:
+def validate_text(orig: str, comp: str) -> ValidationResult:
     result = ValidationResult()
-
-    orig = read_file(original_path)
-    comp = read_file(compressed_path)
-
     validate_headings(orig, comp, result)
     validate_code_blocks(orig, comp, result)
     validate_urls(orig, comp, result)
@@ -184,6 +180,10 @@ def validate(original_path: Path, compressed_path: Path) -> ValidationResult:
     validate_inline_codes(orig, comp, result)
 
     return result
+
+
+def validate(original_path: Path, compressed_path: Path) -> ValidationResult:
+    return validate_text(read_file(original_path), read_file(compressed_path))
 
 
 # ---------- CLI ----------

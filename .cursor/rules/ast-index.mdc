@@ -3,9 +3,11 @@ description: "Use ast-index for structural code navigation before broad raw text
 alwaysApply: true
 ---
 
-Read `.agents/integrations/ast-index.md`. Use `ast-index` first for source-level
-code navigation when an index is available: files, symbols, classes, usages,
-callers, implementations, outlines, dependencies, and project maps.
+Read `.agents/skills/codebase-search/SKILL.md` and
+`.agents/integrations/ast-index.md`. Use `ast-index` first for source-level code
+navigation when an index is available or can be built: files, symbols, classes,
+usages, callers, implementations, outlines, dependencies, and project maps.
 
 Use `rg` for regex, literals, comments, non-code files, or empty ast-index
-results. Do not run the upstream Claude plugin installer from this repo.
+results. Do not run `rg` for completeness after useful ast-index results. Do
+not run the upstream Claude plugin installer from this repo.

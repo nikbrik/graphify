@@ -17,9 +17,12 @@ agent reads, backs up, compresses, validates, and writes the file. Do not call
 Anthropic or Claude CLI unless the user explicitly asks for that backend and
 accepts the data boundary.
 
-A Claude Code skill that compresses your project memory files (`CLAUDE.md`, todos, preferences) into caveman format — so every session loads fewer tokens automatically.
+Repo-local skill that compresses project memory files (`AGENTS.md`,
+`CLAUDE.md`, todos, preferences) into caveman format so every session loads
+fewer tokens automatically.
 
-Claude read `CLAUDE.md` on every session start. If file big, cost big. Caveman make file small. Cost go down forever.
+Agents read memory files on session start. Big file = bigger context cost.
+Caveman make file small. Cost go down.
 
 ## What It Do
 
@@ -29,10 +32,10 @@ Claude read `CLAUDE.md` on every session start. If file big, cost big. Caveman m
 
 ```
 CLAUDE.md          ← compressed (Claude reads this — fewer tokens every session)
-CLAUDE.original.md ← human-readable backup (you edit this)
 ```
 
-Original never lost. You can read and edit `.original.md`. Run skill again to re-compress after edits.
+Use git for rollback. Skill does not create `.original.md` backup files. Run
+skill again to re-compress after edits.
 
 ## Benchmarks
 
@@ -108,7 +111,7 @@ Examples:
 | `.md`, `.txt`, `.rst`, `.typ`, `.typst`, `.tex` | ✅ Yes |
 | Extensionless natural language | ✅ Yes |
 | `.py`, `.js`, `.ts`, `.json`, `.yaml` | ❌ Skip (code/config) |
-| `*.original.md` | ❌ Skip (backup files) |
+| `*.original.md` | ❌ Skip (old backup artifacts) |
 
 ## How It Work
 
@@ -117,21 +120,22 @@ Examples:
         ↓
 detect file type        (no tokens)
         ↓
-Claude compresses       (tokens — one call)
+current agent compresses (default; no external backend)
         ↓
 validate output         (no tokens)
   checks: headings, code blocks, URLs, file paths, bullets
         ↓
-if errors: Claude fixes cherry-picked issues only   (tokens — targeted fix)
+if errors: current agent fixes cherry-picked issues only
   does NOT recompress — only patches broken parts
         ↓
 retry up to 2 times
         ↓
 write compressed → CLAUDE.md
-write original   → CLAUDE.original.md
 ```
 
-Only two things use tokens: initial compression + targeted fix if validation fails. Everything else is local Python.
+Only compression + targeted fix use agent tokens. Everything else is local
+validation. Optional upstream script backend may call Anthropic/Claude only
+after explicit opt-in.
 
 ## What Is Preserved
 

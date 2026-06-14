@@ -3,7 +3,7 @@ name: caveman-compress
 description: >
   Compress natural language memory files (AGENTS.md, .agents/*.md, CLAUDE.md, todos, preferences) into caveman format
   to save input tokens. Preserves all technical substance, code, URLs, and structure.
-  Compressed version overwrites the original file. Human-readable backup saved as FILE.original.md.
+  Compressed version overwrites the original file. No backup files are created; use git for rollback.
   Trigger: /caveman-compress FILEPATH or "compress memory file"
 ---
 
@@ -13,8 +13,8 @@ description: >
 
 Compress natural language memory files (`AGENTS.md`, `.agents/*.md`,
 `CLAUDE.md`, todos, preferences) into caveman-speak to reduce input tokens.
-Compressed version overwrites original. Human-readable backup saved as
-`<filename>.original.md`.
+Compressed version overwrites original. No backup files are created; use git for
+rollback.
 
 ## Repo-Local Multi-Agent Adaptation
 
@@ -32,13 +32,11 @@ repo, treat it as optional Claude/Anthropic tooling, not the default path.
 ## Process
 
 1. Read the target file.
-2. Make a human-readable backup as `<filename>.original.md` if it does not
-   already exist.
-3. Rewrite only natural-language prose. Preserve code blocks, inline code,
+2. Rewrite only natural-language prose. Preserve code blocks, inline code,
    paths, commands, URLs, frontmatter, headings, tables, and structure exactly
    where required by the rules below.
-4. Validate the result manually against the preservation rules before writing.
-5. Return a short summary with backup path and changed file path.
+3. Validate the result manually against the preservation rules before writing.
+4. Return a short summary with changed file path. Do not create backup files.
 
 ## Compression Rules
 
@@ -112,5 +110,5 @@ Compressed:
 - NEVER modify: .py, .js, .ts, .json, .yaml, .yml, .toml, .env, .lock, .css, .html, .xml, .sql, .sh
 - If file has mixed content (prose + code), compress ONLY the prose sections
 - If unsure whether something is code or prose, leave it unchanged
-- Original file is backed up as FILE.original.md before overwriting
-- Never compress FILE.original.md (skip it)
+- No backup files are created. Use git to inspect or restore previous content.
+- Never compress existing FILE.original.md files (skip old backup artifacts)

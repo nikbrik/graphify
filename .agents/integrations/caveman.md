@@ -54,7 +54,7 @@ the upstream docs, not `--all`. For repo-local work, use the checked-in files.
 
 ## Agent Adapters
 
-- Codex: `.codex/skills/caveman*/SKILL.md` routes to canonical `.agents` skills.
+- Codex: root `AGENTS.md` and `.codex/AGENTS.md` route to canonical `.agents` skills; do not mirror skills into `.codex/skills/`.
 - Cursor: `.cursor/rules/caveman.mdc`
 - Cline: `.clinerules/caveman.md`
 - OpenCode: `.opencode/AGENTS.md`

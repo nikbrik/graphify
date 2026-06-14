@@ -52,6 +52,7 @@ What main thread can rely on per agent:
 totals: <counts>.
 ```
 Or `No match.` Always file-path-first, line-number-attached, backticked symbols. Safe to grep with `path:\d+`.
+Uses ast-index before Grep for source-level lookup when `Bash` is available.
 
 **`cavecrew-builder`**
 ```
@@ -76,6 +77,8 @@ Or `No issues.` Findings sorted file → line ascending.
 
 **Parallel scout** (when investigation is broad):
 Spawn 2-3 `cavecrew-investigator` calls in one message (different angles: defs vs callers vs tests). Aggregate in main thread.
+Give one angle per investigator and let each start with ast-index (`search`,
+`symbol`, `refs`, `usages`, `outline`, or `map`) before Grep.
 
 **Single-shot edit** (when site is already known):
 Skip investigator. Hand exact path:line to `cavecrew-builder` directly.

@@ -7,5 +7,8 @@ Integrations:
 - `../integrations/caveman.md`
 - `../skills/`
 
+For source-level code search, use `../skills/codebase-search/SKILL.md` and
+prefer ast-index before broad raw text search.
+
 Keep this rule as a thin adapter. Do not run broad upstream installers or write
 global agent config unless the user explicitly asks.

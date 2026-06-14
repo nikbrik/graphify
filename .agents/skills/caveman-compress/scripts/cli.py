@@ -21,15 +21,25 @@ for _stream in (sys.stdout, sys.stderr):
 
 from pathlib import Path
 
-from .compress import backup_dir_for, compress_file
-from .detect import detect_file_type, should_compress
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from scripts.compress import compress_file
+    from scripts.detect import detect_file_type, should_compress
+else:
+    from .compress import compress_file
+    from .detect import detect_file_type, should_compress
 
 
 def print_usage():
     print("Usage: caveman <filepath>")
+    print("       python -m scripts <filepath>")
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        print_usage()
+        sys.exit(0)
+
     if len(sys.argv) != 2:
         print_usage()
         sys.exit(1)
@@ -64,9 +74,7 @@ def main():
 
         if success:
             print("\nCompression completed successfully")
-            backup_path = backup_dir_for(filepath) / (filepath.stem + ".original.md")
             print(f"Compressed: {filepath}")
-            print(f"Original:   {backup_path}")
             sys.exit(0)
         else:
             print("\n❌ Compression failed after retries")

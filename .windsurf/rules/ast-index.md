@@ -1,5 +1,7 @@
-Read `.agents/integrations/ast-index.md`.
+Read `.agents/skills/codebase-search/SKILL.md` and
+`.agents/integrations/ast-index.md`.
 
 Use `ast-index` before broad raw text search for source-level navigation when
 an index is available. Fall back to `rg` for regex, literals, comments, non-code
-files, or empty ast-index results.
+files, or empty ast-index results. Do not run `rg` for completeness after useful
+ast-index results.

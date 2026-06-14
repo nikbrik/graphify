@@ -3,6 +3,7 @@
 Canonical skill payloads for this repository.
 
 - `ast-index/`: structural code search from `defendend/Claude-ast-index-search`
+- `codebase-search/`: active ast-index-first search policy for agents
 - `caveman/`: terse communication mode
 - `caveman-commit/`: terse Conventional Commit messages
 - `caveman-review/`: terse review comments

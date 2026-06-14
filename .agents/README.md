@@ -23,6 +23,8 @@ Start here for any agent working on this repository.
 Rules:
 - Keep substantive project guidance in `project-spec.md`.
 - Keep integration-specific policy in `integrations/`.
+- For source-level code search, use `skills/codebase-search/SKILL.md`; it
+  actively routes agents to ast-index before broad text search.
 - Keep platform-specific files thin; they should route agents back here instead of duplicating policy.
 - Do not create or update `graphify-out/` unless the user explicitly asks, or unless an existing graph is being maintained after code changes.
 - Do not run broad upstream installers that write global Claude, Codex, or IDE config unless the user explicitly asks for a global install.
