@@ -83,6 +83,18 @@ def test_empty_response_returns_empty_fragment():
     assert llm._parse_llm_json("") == {"nodes": [], "edges": [], "hyperedges": []}
 
 
+def test_parse_result_distinguishes_valid_empty_from_invalid_json():
+    valid_empty = llm._parse_llm_json_result('{"nodes":[],"edges":[],"hyperedges":[]}')
+    assert valid_empty.ok is True
+    assert valid_empty.error is None
+    assert valid_empty.data == {"nodes": [], "edges": [], "hyperedges": []}
+
+    invalid = llm._parse_llm_json_result('{"nodes": [{"id":')
+    assert invalid.ok is False
+    assert invalid.error
+    assert invalid.data == {"nodes": [], "edges": [], "hyperedges": []}
+
+
 # ---------- _call_claude_cli: argv shape ----------
 
 

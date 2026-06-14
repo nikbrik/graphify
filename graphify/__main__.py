@@ -2567,7 +2567,12 @@ def main() -> None:
             args = sys.argv[3:]
             name = args[0] if args and not args[0].startswith("-") else ""
             if not name:
-                print("Usage: graphify provider add <name> --base-url URL --default-model MODEL --env-key KEY", file=sys.stderr)
+                print(
+                    "Usage: graphify provider add <name> --base-url URL --default-model MODEL "
+                    "--env-key KEY [--response-format json_object|json_schema|off] "
+                    "[--extra-body-json JSON] [--require-parameters] [--response-healing]",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
             if name in BACKENDS:
                 print(f"Error: '{name}' is a built-in provider and cannot be overridden.", file=sys.stderr)
@@ -2577,6 +2582,10 @@ def main() -> None:
             env_key = ""
             pricing_input = 0.0
             pricing_output = 0.0
+            response_format = "json_object"
+            extra_body: dict = {}
+            require_parameters = False
+            response_healing = False
             i = 1
             while i < len(args):
                 a = args[i]
@@ -2596,11 +2605,58 @@ def main() -> None:
                     pricing_input = float(args[i + 1]); i += 2
                 elif a == "--pricing-output" and i + 1 < len(args):
                     pricing_output = float(args[i + 1]); i += 2
+                elif a == "--response-format" and i + 1 < len(args):
+                    response_format = args[i + 1]; i += 2
+                elif a.startswith("--response-format="):
+                    response_format = a.split("=", 1)[1]; i += 1
+                elif a == "--extra-body-json" and i + 1 < len(args):
+                    try:
+                        parsed_extra = _json.loads(args[i + 1])
+                    except Exception as exc:
+                        print(f"Error: --extra-body-json must be valid JSON object: {exc}", file=sys.stderr)
+                        sys.exit(2)
+                    if not isinstance(parsed_extra, dict):
+                        print("Error: --extra-body-json must decode to a JSON object.", file=sys.stderr)
+                        sys.exit(2)
+                    extra_body.update(parsed_extra); i += 2
+                elif a.startswith("--extra-body-json="):
+                    try:
+                        parsed_extra = _json.loads(a.split("=", 1)[1])
+                    except Exception as exc:
+                        print(f"Error: --extra-body-json must be valid JSON object: {exc}", file=sys.stderr)
+                        sys.exit(2)
+                    if not isinstance(parsed_extra, dict):
+                        print("Error: --extra-body-json must decode to a JSON object.", file=sys.stderr)
+                        sys.exit(2)
+                    extra_body.update(parsed_extra); i += 1
+                elif a == "--require-parameters":
+                    require_parameters = True; i += 1
+                elif a == "--response-healing":
+                    response_healing = True; i += 1
                 else:
                     i += 1
             if not base_url or not default_model or not env_key:
                 print("Error: --base-url, --default-model, and --env-key are required.", file=sys.stderr)
                 sys.exit(1)
+            if response_format.strip().lower() not in ("json_object", "json_schema", "off", "none", "false", "0"):
+                print(
+                    "Error: --response-format must be one of json_object, json_schema, or off.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if require_parameters:
+                provider_cfg = extra_body.setdefault("provider", {})
+                if not isinstance(provider_cfg, dict):
+                    print("Error: extra_body.provider must be a JSON object for --require-parameters.", file=sys.stderr)
+                    sys.exit(2)
+                provider_cfg["require_parameters"] = True
+            if response_healing:
+                plugins = extra_body.setdefault("plugins", [])
+                if not isinstance(plugins, list):
+                    print("Error: extra_body.plugins must be a JSON array for --response-healing.", file=sys.stderr)
+                    sys.exit(2)
+                if not any(isinstance(p, dict) and p.get("id") == "response-healing" for p in plugins):
+                    plugins.append({"id": "response-healing"})
             from graphify.llm import provider_base_url_ok
             if not provider_base_url_ok(base_url, name):
                 print(f"Error: refusing to add provider with unsafe base_url {base_url!r}.", file=sys.stderr)
@@ -2618,7 +2674,10 @@ def main() -> None:
                 "env_key": env_key,
                 "pricing": {"input": pricing_input, "output": pricing_output},
                 "temperature": 0,
+                "response_format": response_format.strip().lower(),
             }
+            if extra_body:
+                existing[name]["extra_body"] = extra_body
             global_path.write_text(_json.dumps(existing, indent=2) + "\n", encoding="utf-8")
             print(f"Provider '{name}' added. Use with: graphify extract . --backend {name}")
 

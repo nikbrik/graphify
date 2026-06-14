@@ -1,4 +1,5 @@
 import json
+import sys
 import pytest
 from pathlib import Path
 
@@ -162,3 +163,50 @@ def test_detect_backend_custom_provider_after_builtins(monkeypatch):
 
     result = llm.detect_backend()
     assert result == "myprovider"
+
+
+def test_provider_add_stores_response_format_and_openrouter_extra_body(tmp_path, monkeypatch):
+    """New provider flags persist structured-output and OpenRouter helper config."""
+    from graphify import llm
+    import graphify.__main__ as cli
+
+    providers_file = tmp_path / "providers.json"
+    monkeypatch.setattr(
+        llm,
+        "_custom_providers_path",
+        lambda global_=True: providers_file if global_ else tmp_path / "local.json",
+    )
+    monkeypatch.setattr(llm, "BACKENDS", {**llm.BACKENDS})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "graphify",
+            "provider",
+            "add",
+            "openrouter",
+            "--base-url",
+            "https://openrouter.ai/api/v1",
+            "--default-model",
+            "openai/gpt-4.1-mini",
+            "--env-key",
+            "OPENROUTER_API_KEY",
+            "--response-format",
+            "json_schema",
+            "--extra-body-json",
+            '{"provider":{"sort":"throughput"}}',
+            "--require-parameters",
+            "--response-healing",
+        ],
+    )
+
+    cli.main()
+
+    data = json.loads(providers_file.read_text(encoding="utf-8"))
+    cfg = data["openrouter"]
+    assert cfg["response_format"] == "json_schema"
+    assert cfg["extra_body"]["provider"] == {
+        "sort": "throughput",
+        "require_parameters": True,
+    }
+    assert cfg["extra_body"]["plugins"] == [{"id": "response-healing"}]

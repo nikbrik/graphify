@@ -630,6 +630,24 @@ graphify label ./my-project --backend=openai --model gpt-4o   # force a specific
 
 > **Community names:** inside an agent (Claude Code, Gemini CLI) the agent names communities itself. When you run the bare CLI, `cluster-only` auto-names them with the configured backend (built-in or custom OpenAI-compatible provider) — pass `--no-label` to keep `Community N`, or run `graphify label` to (re)generate names on demand.
 
+### OpenRouter and custom OpenAI-compatible providers
+
+Register OpenRouter as a custom provider; graphify will use the same OpenAI-compatible extraction path, but request structured JSON:
+
+```bash
+graphify provider add openrouter \
+  --base-url https://openrouter.ai/api/v1 \
+  --default-model openai/gpt-4.1-mini \
+  --env-key OPENROUTER_API_KEY \
+  --response-format json_schema \
+  --require-parameters \
+  --response-healing
+
+OPENROUTER_API_KEY=... graphify extract . --backend openrouter
+```
+
+`--require-parameters` stores `extra_body.provider.require_parameters=true`, which helps avoid silent routing to providers that ignore structured-output parameters. `--response-healing` stores `extra_body.plugins=[{"id":"response-healing"}]`. OpenRouter structured outputs still require a compatible model/provider; use `--response-format json_object` or `off` if a provider rejects schema mode.
+
 ---
 
 ## Learn more

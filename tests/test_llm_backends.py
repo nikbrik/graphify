@@ -365,6 +365,184 @@ def _install_capturing_openai(monkeypatch):
     return captured
 
 
+def _install_sequence_openai(monkeypatch, responder):
+    """Install an OpenAI stub that delegates each create() call to responder."""
+    import sys
+    import types
+
+    calls = []
+
+    class _FakeOpenAI:
+        def __init__(self, *_, **__):
+            self.chat = self
+            self.completions = self
+
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return responder(kwargs, len(calls))
+
+    fake_module = types.ModuleType("openai")
+    fake_module.OpenAI = _FakeOpenAI
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+    return calls
+
+
+def test_call_openai_compat_sends_default_json_object_response_format(monkeypatch):
+    captured = _install_capturing_openai(monkeypatch)
+
+    llm._call_openai_compat(
+        "https://api.openai.com/v1", "sk-test", "gpt-4.1-mini",
+        "u", temperature=0, max_completion_tokens=8192, backend="openai",
+    )
+
+    assert captured["response_format"] == {"type": "json_object"}
+
+
+def test_call_openai_compat_sends_json_schema_response_format(monkeypatch):
+    captured = _install_capturing_openai(monkeypatch)
+
+    llm._call_openai_compat(
+        "https://openrouter.ai/api/v1", "sk-test", "openai/gpt-4.1-mini",
+        "u", temperature=0, max_completion_tokens=8192, backend="openrouter",
+        response_format="json_schema",
+    )
+
+    response_format = captured["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["name"] == "graphify_extraction"
+    assert response_format["json_schema"]["strict"] is True
+    schema = response_format["json_schema"]["schema"]
+    assert schema["additionalProperties"] is False
+    assert "input_tokens" in schema["required"]
+    assert "output_tokens" in schema["required"]
+    assert "nodes" in schema["properties"]
+    assert schema["properties"]["nodes"]["items"]["additionalProperties"] is False
+
+
+def test_call_openai_compat_response_format_can_be_disabled(monkeypatch):
+    captured = _install_capturing_openai(monkeypatch)
+
+    llm._call_openai_compat(
+        "https://api.openai.com/v1", "sk-test", "gpt-4.1-mini",
+        "u", temperature=0, max_completion_tokens=8192, backend="openai",
+        response_format="off",
+    )
+
+    assert "response_format" not in captured
+
+
+def test_call_openai_compat_retries_without_response_format_when_rejected(monkeypatch):
+    def responder(kwargs, call_no):
+        if call_no == 1:
+            raise ValueError("unsupported parameter: response_format")
+        return _fake_openai_response(
+            '{"nodes":[{"id":"x"}],"edges":[],"hyperedges":[]}',
+            finish_reason="stop",
+            completion_tokens=100,
+        )
+
+    calls = _install_sequence_openai(monkeypatch, responder)
+
+    result = llm._call_openai_compat(
+        "https://compat.example/v1", "sk-test", "m",
+        "u", temperature=0, max_completion_tokens=8192, backend="custom",
+        response_format="json_schema",
+    )
+
+    assert result["nodes"] == [{"id": "x"}]
+    assert len(calls) == 2
+    assert "response_format" in calls[0]
+    assert "response_format" not in calls[1]
+
+
+def test_call_openai_compat_repairs_malformed_json_once(monkeypatch):
+    def responder(_kwargs, call_no):
+        if call_no == 1:
+            return _fake_openai_response(
+                '{"nodes":[{"id":"broken"}',
+                finish_reason="stop",
+                prompt_tokens=10,
+                completion_tokens=20,
+            )
+        return _fake_openai_response(
+            '{"nodes":[{"id":"fixed"}],"edges":[],"hyperedges":[]}',
+            finish_reason="stop",
+            prompt_tokens=30,
+            completion_tokens=40,
+        )
+
+    calls = _install_sequence_openai(monkeypatch, responder)
+
+    result = llm._call_openai_compat(
+        "https://compat.example/v1", "sk-test", "m",
+        "u", temperature=0, max_completion_tokens=8192, backend="custom",
+        response_format="json_object",
+    )
+
+    assert result["nodes"] == [{"id": "fixed"}]
+    assert result["input_tokens"] == 40
+    assert result["output_tokens"] == 60
+    assert len(calls) == 2
+    assert "Repair the malformed assistant output" in calls[1]["messages"][1]["content"]
+
+
+def test_call_openai_compat_does_not_repair_truncated_json(monkeypatch):
+    def responder(_kwargs, call_no):
+        assert call_no == 1, "finish_reason='length' should not trigger repair"
+        return _fake_openai_response(
+            '{"nodes":[{"id":"truncated"}',
+            finish_reason="length",
+            prompt_tokens=10,
+            completion_tokens=20,
+        )
+
+    calls = _install_sequence_openai(monkeypatch, responder)
+
+    result = llm._call_openai_compat(
+        "https://compat.example/v1", "sk-test", "m",
+        "u", temperature=0, max_completion_tokens=8192, backend="custom",
+        response_format="json_object",
+    )
+
+    assert result["finish_reason"] == "length"
+    assert len(calls) == 1
+
+
+def test_extract_files_direct_passes_custom_provider_response_format_and_extra_body(tmp_path, monkeypatch):
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    source = tmp_path / "note.md"
+    source.write_text("# Architecture\n")
+    result = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+    extra_body = {
+        "provider": {"require_parameters": True},
+        "plugins": [{"id": "response-healing"}],
+    }
+    monkeypatch.setattr(llm, "BACKENDS", {
+        **llm.BACKENDS,
+        "openrouter": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "default_model": "openai/gpt-4.1-mini",
+            "env_key": "OPENROUTER_API_KEY",
+            "pricing": {"input": 0.0, "output": 0.0},
+            "temperature": 0,
+            "response_format": "json_schema",
+            "extra_body": extra_body,
+        },
+    })
+
+    with patch("graphify.llm._call_openai_compat", return_value=result) as call:
+        assert llm.extract_files_direct([source], backend="openrouter", root=tmp_path) is result
+
+    assert call.call_args.args[:3] == (
+        "https://openrouter.ai/api/v1",
+        "openrouter-key",
+        "openai/gpt-4.1-mini",
+    )
+    assert call.call_args.kwargs["response_format"] == "json_schema"
+    assert call.call_args.kwargs["extra_body"] == extra_body
+
+
 def test_ollama_extra_body_sets_num_ctx_and_keep_alive(monkeypatch):
     captured = _install_capturing_openai(monkeypatch)
     monkeypatch.delenv("GRAPHIFY_OLLAMA_NUM_CTX", raising=False)
