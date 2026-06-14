@@ -2181,7 +2181,7 @@ def main() -> None:
         print("    --top-k-edges N         per-symbol outbound edges in inspector (default 12)")
         print("    --label NAME            project label in header")
         print("  extract <path>          headless full extraction (AST + semantic LLM) for CI/scripts")
-        print("    --backend B             gemini|kimi|claude|openai|deepseek|ollama (default: whichever API key is set)")
+        print("    --backend B             gemini|kimi|claude|openai|deepseek|ollama|claude-cli|codex-cli (default: whichever API key is set)")
         print("    --model M               override backend default model")
         print("    --mode deep             aggressive INFERRED-edge semantic extraction")
         print("    --max-workers N         AST extraction subprocess count (default: cpu_count)")
@@ -4006,7 +4006,7 @@ def main() -> None:
         # has an API key set.
         if len(sys.argv) < 3:
             print(
-                "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
+                "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama|bedrock|claude-cli|codex-cli] "
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--max-files-per-chunk N] "
@@ -4300,12 +4300,32 @@ def main() -> None:
                         or os.environ.get("AWS_ACCESS_KEY_ID")
                     )
                 elif backend == "claude-cli":
-                    import shutil as _shutil
-                    allow_no_key = _shutil.which("claude") is not None
+                    try:
+                        from graphify.llm import _resolve_claude_cli
+
+                        _resolve_claude_cli()
+                        allow_no_key = True
+                    except RuntimeError:
+                        allow_no_key = False
                     if not allow_no_key:
                         print(
                             "error: backend 'claude-cli' requires the `claude` CLI on $PATH "
                             "(install Claude Code and run `claude` once to authenticate).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                elif backend == "codex-cli":
+                    try:
+                        from graphify.llm import _resolve_codex_cli
+
+                        _resolve_codex_cli()
+                        allow_no_key = True
+                    except RuntimeError:
+                        allow_no_key = False
+                    if not allow_no_key:
+                        print(
+                            "error: backend 'codex-cli' requires the `codex` CLI on $PATH "
+                            "(install Codex CLI and run `codex login` to authenticate).",
                             file=sys.stderr,
                         )
                         sys.exit(1)

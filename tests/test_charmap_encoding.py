@@ -119,6 +119,42 @@ class TestSubprocessEncoding:
             )
         assert len(result["nodes"]) >= 1
 
+    def test_extract_files_direct_codex_cli_subprocess_encoding(self, monkeypatch, tmp_path):
+        f = tmp_path / "doc.md"
+        f.write_text(_UNICODE_CONTENT, encoding="utf-8")
+        completed = MagicMock(returncode=0, stdout="", stderr="")
+
+        def fake_run(args, **kwargs):
+            out_idx = args.index("-o") + 1
+            Path(args[out_idx]).write_text(
+                json.dumps({"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 0, "output_tokens": 0}),
+                encoding="utf-8",
+            )
+            return completed
+
+        monkeypatch.setattr(llm, "_response_is_hollow", lambda r, p: False)
+        with patch("shutil.which", return_value="/fake/bin/codex"), \
+             patch("subprocess.run", side_effect=fake_run) as mock_run:
+            llm.extract_files_direct(files=[f], backend="codex-cli", root=tmp_path)
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("encoding") == "utf-8"
+
+    def test_call_llm_codex_cli_subprocess_encoding(self):
+        """_call_llm with backend='codex-cli' must also use encoding='utf-8'."""
+
+        def fake_run(args, **kwargs):
+            Path(args[args.index("-o") + 1]).write_text("ok", encoding="utf-8")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("shutil.which", return_value="/fake/bin/codex"), \
+             patch("subprocess.run", side_effect=fake_run) as mock_run:
+            llm._call_llm(_UNICODE_CONTENT, backend="codex-cli", max_tokens=200)
+        _args, kwargs = mock_run.call_args
+        assert kwargs.get("encoding") == "utf-8", (
+            "_call_llm codex-cli subprocess must use encoding='utf-8'; "
+            f"got encoding={kwargs.get('encoding')!r}"
+        )
+
     def test_call_llm_claude_cli_subprocess_encoding(self, monkeypatch):
         """_call_llm with backend='claude-cli' must also use encoding='utf-8'."""
         completed = MagicMock(

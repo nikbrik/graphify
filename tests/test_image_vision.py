@@ -14,6 +14,7 @@ import json
 import sys
 import types
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -81,7 +82,7 @@ def test_partition_splits_raster_from_text(tmp_path):
 def test_build_image_refs_sets_rel_media_and_bytes(tmp_path):
     img, _, _ = _make_corpus(tmp_path)
     (ref,) = llm._build_image_refs([img], tmp_path)
-    assert ref.rel == "sub/diagram.png"
+    assert Path(ref.rel).as_posix() == "sub/diagram.png"
     assert ref.media_type == "image/png"
     assert ref.raw == _PNG_BYTES
     assert ref.b64  # non-empty base64
@@ -98,8 +99,8 @@ def test_build_image_refs_drops_oversized(tmp_path, monkeypatch):
 
 
 def test_path_backend_skips_byte_read_and_size_cap(tmp_path, monkeypatch):
-    # Path-based backends (claude-cli) read the file themselves, so
-    # _build_image_refs(read_bytes=False) loads no bytes and applies no size cap.
+    # Path/cli-attach backends (claude-cli, codex-cli) read or attach the file
+    # themselves, so _build_image_refs(read_bytes=False) loads no bytes.
     big = tmp_path / "huge.png"
     big.write_bytes(b"x" * 64)
     monkeypatch.setattr(llm, "_MAX_IMAGE_BYTES", 8)
@@ -129,8 +130,70 @@ def test_claude_cli_passes_oversized_image_by_path(tmp_path, monkeypatch):
     assert str(refs[0].path) in seen["input"]
 
 
+def test_codex_cli_passes_oversized_image_by_path(tmp_path, monkeypatch):
+    big = tmp_path / "huge.png"
+    big.write_bytes(b"x" * 100)
+    monkeypatch.setattr(llm, "_MAX_IMAGE_BYTES", 8)
+    refs = llm._build_image_refs([big], tmp_path, read_bytes=False)
+    seen: dict = {}
+
+    def fake_run(args, **kwargs):
+        seen["argv"] = args
+        out_idx = args.index("-o") + 1
+        Path(args[out_idx]).write_text(_NODE_JSON, encoding="utf-8")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(llm, "_response_is_hollow", lambda r, p: False)
+    with patch("shutil.which", return_value="/fake/codex"), \
+         patch("subprocess.run", side_effect=fake_run):
+        llm._call_codex_cli("CORPUS", images=refs, root=tmp_path)
+    assert str(refs[0].path) in seen["argv"]
+
+
+def test_extract_files_direct_skips_image_bytes_for_codex_cli(tmp_path, monkeypatch):
+    img = tmp_path / "huge.png"
+    img.write_bytes(b"x" * 100)
+    doc = tmp_path / "readme.md"
+    doc.write_text("# Doc\n")
+    monkeypatch.setattr(llm, "_MAX_IMAGE_BYTES", 8)
+    seen: dict = {}
+
+    def fake_run(args, **kwargs):
+        seen["argv"] = args
+        out_idx = args.index("-o") + 1
+        Path(args[out_idx]).write_text(_NODE_JSON, encoding="utf-8")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(llm, "_response_is_hollow", lambda r, p: False)
+    with patch("shutil.which", return_value="/fake/codex"), \
+         patch("subprocess.run", side_effect=fake_run):
+        llm.extract_files_direct(files=[doc, img], backend="codex-cli", root=tmp_path)
+    assert "-i" in seen["argv"]
+    assert str(img.resolve()) in seen["argv"]
+
+
+def test_codex_cli_passes_image_via_flag(tmp_path, monkeypatch):
+    img = tmp_path / "diagram.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+    refs = llm._build_image_refs([img], tmp_path, read_bytes=False)
+    seen: dict = {}
+
+    def fake_run(args, **kwargs):
+        seen["argv"] = args
+        out_idx = args.index("-o") + 1
+        Path(args[out_idx]).write_text(_NODE_JSON, encoding="utf-8")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(llm, "_response_is_hollow", lambda r, p: False)
+    with patch("shutil.which", return_value="/fake/codex"), \
+         patch("subprocess.run", side_effect=fake_run):
+        llm._call_codex_cli("CORPUS", images=refs, root=tmp_path)
+    assert "-i" in seen["argv"]
+    assert str(refs[0].path) in seen["argv"]
+
+
 def test_capability_flags(monkeypatch):
-    for b in ("claude", "claude-cli", "openai", "gemini", "bedrock", "kimi"):
+    for b in ("claude", "claude-cli", "codex-cli", "openai", "gemini", "bedrock", "kimi"):
         assert llm._backend_supports_vision(b), b
     assert not llm._backend_supports_vision("deepseek")
     # ollama is opt-in via env (default model is text-only)
@@ -199,8 +262,8 @@ def test_builders_fall_back_to_string_without_pixels(tmp_path):
     # No pixels -> Anthropic/OpenAI render a plain string carrying the note
     ac = llm._anthropic_content("CORPUS", stripped)
     oc = llm._openai_content("CORPUS", stripped)
-    assert isinstance(ac, str) and "sub/diagram.png" in ac
-    assert isinstance(oc, str) and "sub/diagram.png" in oc
+    assert isinstance(ac, str) and "sub/diagram.png" in ac.replace("\\", "/")
+    assert isinstance(oc, str) and "sub/diagram.png" in oc.replace("\\", "/")
 
 
 def test_no_images_is_byte_identical(tmp_path):
@@ -342,4 +405,4 @@ def test_extract_files_direct_gates_pixels_by_capability(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
     llm.extract_files_direct([doc, img], backend="deepseek", root=tmp_path)
     content = captured["messages"][1]["content"]
-    assert isinstance(content, str) and "sub/diagram.png" in content
+    assert isinstance(content, str) and "sub/diagram.png" in content.replace("\\", "/")

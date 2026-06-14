@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -146,6 +147,17 @@ BACKENDS: dict[str, dict] = {
         "max_tokens": 16384,
         # Claude Code is multimodal; images are passed by path and read with the
         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
+        "vision": True,
+    },
+    "codex-cli": {
+        # Routes through the locally-installed `codex` CLI (`codex exec`) using
+        # `--output-schema` + ChatGPT OAuth auth instead of OPENAI_API_KEY.
+        "default_model": "codex-cli-plan",
+        "model_env_key": "GRAPHIFY_CODEX_CLI_MODEL",
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": 0,
+        "max_tokens": 16384,
+        # Images are attached with `codex exec -i` (native vision, not Read-tool).
         "vision": True,
     },
 }
@@ -418,6 +430,17 @@ _COMPACT_MODEL_FRAGMENTS = (
     "nano",
     "haiku",
 )
+
+# Appended to the extraction system prompt for codex-cli only. Codex is an agent
+# CLI; without an explicit no-tools constraint it may shell out instead of
+# returning structured JSON.
+_CODEX_CLI_AGENT_SUFFIX = """
+
+AGENT CONSTRAINTS: Do NOT invoke shell commands, tools, or file reads beyond any
+attached images. The source file contents are provided in stdin. Output ONLY the
+final JSON object matching the output schema — no markdown fences, no preamble,
+no explanation.
+"""
 
 
 def _is_compact_model(model: str) -> bool:
@@ -747,6 +770,8 @@ _MAX_IMAGES_PER_CHUNK = 20
 # instead of inlining base64. They open the file themselves and downsample as
 # needed, so `_MAX_IMAGE_BYTES` does not apply and the bytes never need loading.
 _PATH_IMAGE_BACKENDS = {"claude-cli"}
+# Backends that attach images by CLI flag/path (codex `-i`) rather than inline bytes.
+_CLI_IMAGE_PATH_BACKENDS = frozenset({"claude-cli", "codex-cli"})
 
 
 @dataclass
@@ -790,8 +815,8 @@ def _build_image_refs(image_files: list[Path], root: Path, *, read_bytes: bool =
 
     `read_bytes=True` (base64 backends) loads the pixels and drops any image over
     `_MAX_IMAGE_BYTES` to a reference, because a base64 request body has a hard
-    size ceiling. `read_bytes=False` (path-based backends — claude-cli)
-    skips the read entirely: those backends open the file themselves and
+    size ceiling. `read_bytes=False` (path/cli-attach backends — claude-cli,
+    codex-cli) skips the read entirely: those backends open or attach the file
     downsample as needed, so there is no per-image size limit and no reason to
     load (potentially tens of MB of) bytes that would never be used.
     """
@@ -1114,7 +1139,15 @@ def _get_backend_api_key(backend: str) -> str:
 def _format_backend_env_keys(backend: str) -> str:
     """Return user-facing accepted API-key variable names."""
     keys = _backend_env_keys(backend)
-    return " or ".join(keys) if keys else "AWS_PROFILE or AWS_REGION"
+    if keys:
+        return " or ".join(keys)
+    if backend == "claude-cli":
+        return "the `claude` CLI on $PATH (Claude Code subscription)"
+    if backend == "codex-cli":
+        return "the `codex` CLI on $PATH (run `codex login`)"
+    if backend == "bedrock":
+        return "AWS_PROFILE or AWS_REGION"
+    return "AWS_PROFILE or AWS_REGION"
 
 
 def _default_model_for_backend(backend: str) -> str:
@@ -1445,7 +1478,49 @@ def _claude_cli_envelope(stdout: str) -> dict:
     return envelope
 
 
-def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bool = False, images: list[_ImageRef] | None = None) -> dict:
+def _resolve_claude_cli() -> str:
+    """Return the path/name of the Claude Code CLI binary, preferring claude.cmd on Windows."""
+    import platform
+    import shutil
+
+    if platform.system() == "Windows":
+        cmd_path = shutil.which("claude.cmd")
+        if cmd_path:
+            return cmd_path
+        if shutil.which("claude") is None:
+            raise RuntimeError(
+                "Claude Code CLI not found on $PATH. Install from "
+                "https://claude.ai/code and run `claude` once to authenticate."
+            )
+        return "claude"
+    if shutil.which("claude") is None:
+        raise RuntimeError(
+            "Claude Code CLI not found on $PATH. Install from "
+            "https://claude.ai/code and run `claude` once to authenticate."
+        )
+    return "claude"
+
+
+def _resolve_claude_cli_model(explicit: str | None = None) -> str | None:
+    """Return a model id for `claude -p --model`, or None for the CLI default."""
+    cfg = BACKENDS["claude-cli"]
+    placeholder = cfg["default_model"]
+    env_model = os.environ.get("GRAPHIFY_CLAUDE_CLI_MODEL", "").strip()
+    if explicit and explicit.strip() and explicit.strip() != placeholder:
+        return explicit.strip()
+    if env_model:
+        return env_model
+    return None
+
+
+def _call_claude_cli(
+    user_message: str,
+    max_tokens: int = 8192,
+    *,
+    deep_mode: bool = False,
+    images: list[_ImageRef] | None = None,
+    model: str | None = None,
+) -> dict:
     """Call Claude via the locally-installed Claude Code CLI (`claude -p`).
 
     Routes through the user's Claude Code subscription auth instead of a separate
@@ -1456,31 +1531,9 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bo
     the model to open each one with its Read tool, and each containing directory
     is allowlisted with `--add-dir` so the read is permitted.
     """
-    import platform
-    import shutil
     import subprocess
 
-    # On Windows, npm installs `claude` as both `claude.ps1` and `claude.cmd`
-    # alongside each other. When PATHEXT lists `.PS1` before `.CMD`,
-    # `shutil.which("claude")` returns `claude.ps1`, which `CreateProcess`
-    # cannot execute directly — it raises `[WinError 2] The system cannot
-    # find the file specified`. `claude.cmd` IS executable by CreateProcess,
-    # so prefer it explicitly on Windows. See issue #1072.
-    claude_cmd = "claude"
-    if platform.system() == "Windows":
-        cmd_path = shutil.which("claude.cmd")
-        if cmd_path:
-            claude_cmd = cmd_path
-        elif shutil.which("claude") is None:
-            raise RuntimeError(
-                "Claude Code CLI not found on $PATH. Install from "
-                "https://claude.ai/code and run `claude` once to authenticate."
-            )
-    elif shutil.which("claude") is None:
-        raise RuntimeError(
-            "Claude Code CLI not found on $PATH. Install from "
-            "https://claude.ai/code and run `claude` once to authenticate."
-        )
+    claude_cmd = _resolve_claude_cli()
 
     # Use --system-prompt (replaces) instead of --append-system-prompt (adds
     # to Claude Code's default coding-agent prompt). The default prompt
@@ -1509,12 +1562,7 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bo
         *add_dir_args,
         "--system-prompt", _extraction_system(deep=deep_mode),
     ]
-    # claude-cli defaults to Opus, which is overkill for the structured-JSON
-    # extraction graphify performs. GRAPHIFY_CLAUDE_CLI_MODEL=haiku (or
-    # sonnet, or a full model ID like claude-haiku-4-5-20251001) lets users
-    # opt into a cheaper / faster model. Default behaviour unchanged when
-    # the env var is unset.
-    cli_model = os.environ.get("GRAPHIFY_CLAUDE_CLI_MODEL", "").strip()
+    cli_model = _resolve_claude_cli_model(model)
     if cli_model:
         cli_args.extend(["--model", cli_model])
     proc = subprocess.run(
@@ -1555,6 +1603,254 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bo
         )
         result["finish_reason"] = "length"
     return result
+
+
+def _resolve_codex_cli() -> str:
+    """Return the path/name of the Codex CLI binary, preferring codex.cmd on Windows."""
+    import platform
+    import shutil
+
+    if platform.system() == "Windows":
+        cmd_path = shutil.which("codex.cmd")
+        if cmd_path:
+            return cmd_path
+        if shutil.which("codex") is None:
+            raise RuntimeError(
+                "Codex CLI not found on $PATH. Install from "
+                "https://developers.openai.com/codex and run `codex login` to authenticate."
+            )
+        return "codex"
+    if shutil.which("codex") is None:
+        raise RuntimeError(
+            "Codex CLI not found on $PATH. Install from "
+            "https://developers.openai.com/codex and run `codex login` to authenticate."
+        )
+    return "codex"
+
+
+def _write_extraction_schema_file() -> Path:
+    """Write `_GRAPHIFY_EXTRACTION_JSON_SCHEMA` to a temp file for `codex exec --output-schema`."""
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="graphify-extraction-schema.")
+    os.close(fd)
+    schema_path = Path(path)
+    schema_path.write_text(
+        json.dumps(_GRAPHIFY_EXTRACTION_JSON_SCHEMA, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return schema_path
+
+
+def _resolve_codex_cli_model(explicit: str | None = None) -> str | None:
+    """Return a model id for `codex exec -m`, or None to use the Codex user default."""
+    cfg = BACKENDS["codex-cli"]
+    placeholder = cfg["default_model"]
+    env_key = cfg.get("model_env_key", "GRAPHIFY_CODEX_CLI_MODEL")
+    env_model = os.environ.get(env_key, "").strip()
+    if explicit and explicit.strip() and explicit.strip() != placeholder:
+        return explicit.strip()
+    if env_model:
+        return env_model
+    return None
+
+
+def _codex_cli_sandbox_args() -> list[str]:
+    """Sandbox flags for headless `codex exec` runs."""
+    mode = os.environ.get("GRAPHIFY_CODEX_CLI_SANDBOX", "read-only").strip().lower()
+    if mode in ("bypass", "yolo", "danger", "danger-full-access"):
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    return ["--sandbox", "read-only"]
+
+
+def _codex_cli_usage_from_jsonl(stdout: str) -> tuple[int, int, str | None]:
+    """Best-effort token/model extraction from `codex exec --json` JSONL stdout."""
+    input_tokens = 0
+    output_tokens = 0
+    model_name: str | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        usage = event.get("usage") or event.get("token_usage")
+        if isinstance(usage, dict):
+            input_tokens = max(
+                input_tokens,
+                int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+            )
+            output_tokens = max(
+                output_tokens,
+                int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+            )
+        for key in ("model", "model_id"):
+            if event.get(key):
+                model_name = str(event[key])
+        msg = event.get("msg") or event.get("message")
+        if isinstance(msg, dict):
+            for key in ("model", "model_id"):
+                if msg.get(key):
+                    model_name = str(msg[key])
+    return input_tokens, output_tokens, model_name
+
+
+def _call_codex_cli_text(
+    prompt: str,
+    *,
+    model: str | None = None,
+    max_tokens: int = 8192,  # noqa: ARG001 — Codex has no direct max-tokens flag
+) -> str:
+    """Run `codex exec` and return the final assistant message (plain text, no schema)."""
+    import subprocess
+
+    codex_cmd = _resolve_codex_cli()
+    fd, out_path_str = tempfile.mkstemp(suffix=".txt", prefix="graphify-codex-text.")
+    os.close(fd)
+    output_path = Path(out_path_str)
+    cli_args = [
+        codex_cmd,
+        "exec",
+        *_codex_cli_sandbox_args(),
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "-o",
+        str(output_path),
+    ]
+    cli_model = _resolve_codex_cli_model(model)
+    if cli_model:
+        cli_args.extend(["-m", cli_model])
+    cli_args.append(prompt)
+    try:
+        proc = subprocess.run(
+            cli_args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_resolve_api_timeout(),
+            check=False,
+            **_no_window_kwargs(),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"codex exec exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+            )
+        if output_path.is_file() and output_path.stat().st_size > 0:
+            return output_path.read_text(encoding="utf-8")
+        return proc.stdout.strip()
+    finally:
+        output_path.unlink(missing_ok=True)
+
+
+def _call_codex_cli(
+    user_message: str,
+    max_tokens: int = 8192,  # noqa: ARG001 — reserved; Codex has no direct max-tokens flag
+    *,
+    deep_mode: bool = False,
+    images: list[_ImageRef] | None = None,
+    model: str | None = None,
+    root: Path | None = None,
+) -> dict:
+    """Call OpenAI Codex via `codex exec` using ChatGPT subscription auth.
+
+    Uses `--output-schema` with `_GRAPHIFY_EXTRACTION_JSON_SCHEMA` and reads the
+    final response from `-o / --output-last-message`. Authenticates via `codex login`
+    instead of OPENAI_API_KEY.
+    """
+    import subprocess
+
+    codex_cmd = _resolve_codex_cli()
+    schema_path = _write_extraction_schema_file()
+    fd, out_path_str = tempfile.mkstemp(suffix=".json", prefix="graphify-codex-output.")
+    os.close(fd)
+    output_path = Path(out_path_str)
+
+    if images:
+        user_message = _with_image_notes(user_message, images, with_paths=False)
+
+    cli_model = _resolve_codex_cli_model(model)
+    compact = _is_compact_model(cli_model or "")
+    system_prompt = _extraction_system(deep=deep_mode, compact=compact) + _CODEX_CLI_AGENT_SUFFIX
+    work_root = str((root or Path.cwd()).resolve())
+
+    cli_args = [
+        codex_cmd,
+        "exec",
+        *_codex_cli_sandbox_args(),
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--json",
+        "--output-schema",
+        str(schema_path),
+        "-o",
+        str(output_path),
+        "-C",
+        work_root,
+    ]
+    if cli_model:
+        cli_args.extend(["-m", cli_model])
+    if images:
+        for ref in images:
+            cli_args.extend(["-i", str(ref.path)])
+    cli_args.append(system_prompt)
+
+    try:
+        proc = subprocess.run(
+            cli_args,
+            input=user_message,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_resolve_api_timeout(),
+            check=False,
+            **_no_window_kwargs(),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"codex exec exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+            )
+
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RuntimeError(
+                "codex exec produced no output-last-message file; "
+                f"stderr: {proc.stderr.strip()[:500]}"
+            )
+
+        raw_content = output_path.read_text(encoding="utf-8").strip()
+        if len(raw_content) >= 2 and raw_content[0] == raw_content[-1] == '"':
+            try:
+                unwrapped = json.loads(raw_content)
+                if isinstance(unwrapped, str):
+                    raw_content = unwrapped
+            except json.JSONDecodeError:
+                pass
+        parse_result = _parse_llm_json_result(raw_content or "{}")
+        result = parse_result.data
+        in_tok, out_tok, json_model = _codex_cli_usage_from_jsonl(proc.stdout)
+        result["input_tokens"] = in_tok
+        result["output_tokens"] = out_tok
+        result["model"] = json_model or cli_model or "codex-cli-plan"
+        result["finish_reason"] = "stop"
+        if not parse_result.ok or _response_is_hollow(raw_content, result):
+            if not parse_result.ok:
+                print(
+                    "[graphify] codex-cli returned unparseable JSON; treating as "
+                    "truncation so adaptive retry can bisect the chunk.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "[graphify] codex-cli returned a hollow response; treating as "
+                    "truncation so adaptive retry can bisect the chunk.",
+                    file=sys.stderr,
+                )
+            result["finish_reason"] = "length"
+        return result
+    finally:
+        schema_path.unlink(missing_ok=True)
+        output_path.unlink(missing_ok=True)
 
 
 def _azure_client(api_key: str, endpoint: str):
@@ -1705,7 +2001,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "codex-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -1718,8 +2014,8 @@ def extract_files_direct(
     user_msg = _read_files(text_files, root)
     vision = _backend_supports_vision(backend)
     # Only base64 (inline) vision backends need the bytes loaded + size-capped;
-    # path-based backends (claude-cli) and non-vision backends do not.
-    read_bytes = vision and backend not in _PATH_IMAGE_BACKENDS
+    # CLI path/attach backends (claude-cli, codex-cli) and non-vision backends do not.
+    read_bytes = vision and backend not in _CLI_IMAGE_PATH_BACKENDS
     image_refs = _build_image_refs(image_files, root, read_bytes=read_bytes) if image_files else []
     if image_refs and not vision:
         image_refs = _strip_pixels(image_refs)
@@ -1728,7 +2024,22 @@ def extract_files_direct(
     if backend == "claude":
         return _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "claude-cli":
-        return _call_claude_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+        return _call_claude_cli(
+            user_msg,
+            max_tokens=max_out,
+            deep_mode=deep_mode,
+            images=image_refs,
+            model=mdl,
+        )
+    if backend == "codex-cli":
+        return _call_codex_cli(
+            user_msg,
+            max_tokens=max_out,
+            deep_mode=deep_mode,
+            images=image_refs,
+            model=mdl,
+            root=root,
+        )
     if backend == "bedrock":
         return _call_bedrock(mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "azure":
@@ -2146,6 +2457,10 @@ def extract_corpus_parallel(
     # over session state. Force serial unless the user explicitly opts in.
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
+    # codex-cli shells out to Codex agent sessions; parallel subprocesses can
+    # conflict over auth/session state. Force serial unless the user opts in.
+    if backend == "codex-cli" and os.environ.get("GRAPHIFY_CODEX_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
     workers = max(1, min(max_concurrency, total))
     if workers == 1:
         # Avoid thread pool overhead for single-worker runs (and keep
@@ -2225,7 +2540,7 @@ def _call_llm(
         ollama_url = os.environ.get("OLLAMA_BASE_URL", cfg.get("base_url", ""))
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "codex-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
         )
@@ -2245,22 +2560,13 @@ def _call_llm(
         return resp.content[0].text if resp.content else ""
 
     if backend == "claude-cli":
-        import platform, shutil, subprocess
-        # Mirror the extraction-path resolution: on Windows the npm shim is
-        # claude.cmd, which CreateProcess can't resolve from a bare "claude"
-        # (PATHEXT doesn't apply), so pass the resolved .cmd path explicitly.
-        claude_cmd = "claude"
-        if platform.system() == "Windows":
-            cmd_path = shutil.which("claude.cmd")
-            if cmd_path:
-                claude_cmd = cmd_path
-            elif shutil.which("claude") is None:
-                raise RuntimeError("Claude Code CLI not found on $PATH")
-        elif shutil.which("claude") is None:
-            raise RuntimeError("Claude Code CLI not found on $PATH")
+        import subprocess
+
+        claude_cmd = _resolve_claude_cli()
         cli_args = [claude_cmd, "-p", "--output-format", "json", "--no-session-persistence"]
-        if model is not None:
-            cli_args.extend(["--model", mdl])
+        cli_model = _resolve_claude_cli_model(mdl)
+        if cli_model:
+            cli_args.extend(["--model", cli_model])
         proc = subprocess.run(
             cli_args,
             input=prompt,
@@ -2275,6 +2581,9 @@ def _call_llm(
             raise RuntimeError(f"claude -p exited {proc.returncode}: {proc.stderr.strip()[:500]}")
         envelope = _claude_cli_envelope(proc.stdout)
         return envelope.get("result", "")
+
+    if backend == "codex-cli":
+        return _call_codex_cli_text(prompt, model=mdl, max_tokens=max_tokens)
 
 
     if backend == "bedrock":
@@ -2454,7 +2763,7 @@ def detect_backend() -> str | None:
         _validate_ollama_base_url(ollama_url)
         return "ollama"
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli"):
+        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli", "codex-cli"):
             if _get_backend_api_key(name):
                 return name
     return None

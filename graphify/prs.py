@@ -568,9 +568,21 @@ def _resolve_triage_backend() -> tuple[str, str]:
                      or _default_model_for_backend(b))
             return b, model
 
-    import shutil
-    if shutil.which("claude"):
+    try:
+        from graphify.llm import _resolve_claude_cli
+
+        _resolve_claude_cli()
         return "claude-cli", "claude-code-plan"
+    except RuntimeError:
+        pass
+
+    try:
+        from graphify.llm import _resolve_codex_cli
+
+        _resolve_codex_cli()
+        return "codex-cli", "codex-cli-plan"
+    except RuntimeError:
+        pass
 
     return "ollama", _default_model_for_backend("ollama")
 
@@ -643,24 +655,20 @@ def triage_with_opus(prs: list[PRInfo], base: str) -> None:
             print("\n")
 
         elif backend == "claude-cli":
-            import platform as _platform, shutil as _shutil, subprocess as _sp
-            _claude = "claude"
-            if _platform.system() == "Windows":
-                _claude = _shutil.which("claude.cmd") or _shutil.which("claude") or "claude"
-            proc = _sp.run(
-                [_claude, "-p", "--no-session-persistence"],
-                input=prompt, capture_output=True, text=True, timeout=120,
-            )
-            if proc.returncode != 0:
-                print(red(f"  claude -p failed: {proc.stderr.strip()[:300]}"), file=sys.stderr)
-            else:
-                try:
-                    result = json.loads(proc.stdout).get("result") or proc.stdout
-                except json.JSONDecodeError:
-                    result = proc.stdout
-                for line in result.splitlines():
-                    print(f"  {line}")
-                print()
+            from graphify.llm import _call_llm
+
+            result = _call_llm(prompt, backend="claude-cli", max_tokens=1024, model=model)
+            for line in result.splitlines():
+                print(f"  {line}")
+            print()
+
+        elif backend == "codex-cli":
+            from graphify.llm import _call_llm
+
+            result = _call_llm(prompt, backend="codex-cli", max_tokens=1024, model=model)
+            for line in result.splitlines():
+                print(f"  {line}")
+            print()
 
     except Exception as e:
         print(f"\n\n  {red(f'Triage failed: {e}')}", file=sys.stderr)

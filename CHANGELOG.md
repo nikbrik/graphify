@@ -4,6 +4,7 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## Unreleased
 
+- Feat: `codex-cli` backend for headless semantic extraction via `codex exec` + ChatGPT subscription auth (`codex login`). Uses `--output-schema` with the Graphify extraction JSON schema, serial-by-default chunk processing (`GRAPHIFY_CODEX_CLI_PARALLEL=1` to opt in), Windows `codex.cmd` resolution, and optional `GRAPHIFY_CODEX_CLI_MODEL` / `GRAPHIFY_CODEX_CLI_SANDBOX` overrides. Also wired into `graphify prs --triage` fallback when no API keys are set.
 - Fix: `graphify query`, `graphify explain`, and MCP `query_graph`/`get_node` now show the human-readable community name (e.g. "FlashAttention Paper") instead of a blank or numeric ID after running `cluster-only`. `to_json` now accepts `community_labels` and embeds `community_name` on each node; read paths fall back to the numeric `community` field for backward compatibility with old graphs (#1305).
 - Fix: `graphify-mcp` and `python -m graphify.serve` now accept `--graph <path>` as an alias for the positional argument, consistent with every other graphify subcommand. Previously `--graph` raised "unrecognized arguments" (#1304).
 
