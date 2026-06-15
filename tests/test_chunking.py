@@ -125,6 +125,14 @@ def test_pack_chunks_splits_many_small_docs_by_output_budget(tmp_path):
     assert sum(len(c) for c in chunks) == 50
 
 
+def test_default_output_token_budget_deepseek_uses_raised_cap(monkeypatch):
+    from graphify import llm
+
+    monkeypatch.delenv("GRAPHIFY_MAX_OUTPUT_TOKENS", raising=False)
+
+    assert llm._default_output_token_budget("deepseek") == int(32768 * 0.75)
+
+
 def test_pack_chunks_respects_max_files_per_chunk_override(tmp_path):
     from graphify.llm import _pack_chunks_by_tokens
 

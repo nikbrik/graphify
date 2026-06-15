@@ -472,17 +472,20 @@ def test_call_openai_compat_repairs_malformed_json_once(monkeypatch):
         )
 
     calls = _install_sequence_openai(monkeypatch, responder)
+    extra_body = {"thinking": {"type": "disabled"}}
 
     result = llm._call_openai_compat(
         "https://compat.example/v1", "sk-test", "m",
         "u", temperature=0, max_completion_tokens=8192, backend="custom",
-        response_format="json_object",
+        response_format="json_object", extra_body=extra_body,
     )
 
     assert result["nodes"] == [{"id": "fixed"}]
     assert result["input_tokens"] == 40
     assert result["output_tokens"] == 60
     assert len(calls) == 2
+    assert calls[0]["extra_body"] == extra_body
+    assert calls[1]["extra_body"] == extra_body
     assert "Repair the malformed assistant output" in calls[1]["messages"][1]["content"]
 
 
@@ -560,11 +563,26 @@ def test_extract_files_direct_uses_max_tokens_when_max_completion_tokens_missing
     assert call.call_args.kwargs["max_completion_tokens"] == 16384
 
 
+def test_extract_files_direct_passes_deepseek_parity_defaults(tmp_path, monkeypatch):
+    _clear_backend_env(monkeypatch)
+    monkeypatch.delenv("GRAPHIFY_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-key")
+    source = tmp_path / "note.md"
+    source.write_text("# Architecture\n")
+    result = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+
+    with patch("graphify.llm._call_openai_compat", return_value=result) as call:
+        llm.extract_files_direct([source], backend="deepseek", root=tmp_path)
+
+    assert call.call_args.kwargs["max_completion_tokens"] == 32768
+    assert call.call_args.kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
 def test_call_openai_compat_downgrades_json_schema_for_compact_model(monkeypatch):
     captured = _install_capturing_openai(monkeypatch)
 
     llm._call_openai_compat(
-        "https://openrouter.ai/api/v1", "sk-test", "deepseek/deepseek-v4-flash",
+        "https://openrouter.ai/api/v1", "sk-test", "deepseek/deepseek-chat-7b",
         "u", temperature=0, max_completion_tokens=8192, backend="openrouter",
         response_format="json_schema",
     )
@@ -594,12 +612,24 @@ def test_call_openai_compat_truncated_json_sets_finish_reason_length(monkeypatch
     assert len(calls) == 1
 
 
-def test_call_openai_compat_compact_model_uses_compact_system_prompt(monkeypatch):
+def test_call_openai_compat_deepseek_v4_flash_uses_full_system_prompt(monkeypatch):
     captured = _install_capturing_openai(monkeypatch)
 
     llm._call_openai_compat(
         "https://api.deepseek.com", "sk-test", "deepseek-v4-flash",
         "u", temperature=0, max_completion_tokens=8192, backend="deepseek",
+    )
+
+    system = captured["messages"][0]["content"]
+    assert "COMPACT_MODE" not in system
+
+
+def test_call_openai_compat_legacy_small_model_uses_compact_system_prompt(monkeypatch):
+    captured = _install_capturing_openai(monkeypatch)
+
+    llm._call_openai_compat(
+        "https://openrouter.ai/api/v1", "sk-test", "deepseek/deepseek-chat-7b",
+        "u", temperature=0, max_completion_tokens=8192, backend="openrouter",
     )
 
     system = captured["messages"][0]["content"]

@@ -123,7 +123,8 @@ BACKENDS: dict[str, dict] = {
         # deepseek-reasoner / thinking-mode models silently ignore temperature;
         # deepseek-chat / v4-flash (non-thinking) accept 0-2. Safe to send 0.
         "temperature": 0,
-        "max_tokens": 16384,
+        "max_tokens": 32768,
+        "extra_body": {"thinking": {"type": "disabled"}},
     },
     "azure": {
         # Azure OpenAI Service — uses AzureOpenAI SDK client, not the standard
@@ -442,6 +443,10 @@ _COMPACT_MODEL_FRAGMENTS = (
     "nano",
     "haiku",
 )
+_COMPACT_MODEL_EXEMPTIONS = (
+    "deepseek-v4-",
+    "deepseek/deepseek-v4-",
+)
 
 # Appended to the extraction system prompt for codex-cli only. Codex is an agent
 # CLI; without an explicit no-tools constraint it may shell out instead of
@@ -458,6 +463,8 @@ no explanation.
 def _is_compact_model(model: str) -> bool:
     """Heuristic: smaller/cheaper models need shorter outputs to avoid truncation."""
     name = (model or "").lower()
+    if any(fragment in name for fragment in _COMPACT_MODEL_EXEMPTIONS):
+        return False
     return any(fragment in name for fragment in _COMPACT_MODEL_FRAGMENTS)
 
 
@@ -1213,6 +1220,7 @@ def _repair_openai_compat_json(
     max_completion_tokens: int,
     backend: str,
     response_format: dict | None,
+    extra_body: dict | None = None,
 ) -> tuple[_LLMJsonParseResult, int, int]:
     """One-shot JSON repair using the same OpenAI-compatible client/model."""
     schema = json.dumps(_GRAPHIFY_EXTRACTION_JSON_SCHEMA, separators=(",", ":"))
@@ -1241,6 +1249,8 @@ def _repair_openai_compat_json(
         kwargs["reasoning_effort"] = reasoning_effort
     if response_format is not None:
         kwargs["response_format"] = response_format
+    if extra_body is not None:
+        kwargs["extra_body"] = extra_body
     try:
         resp, _ = _create_chat_completion_with_format_fallback(client, kwargs, backend)
     except Exception as exc:  # noqa: BLE001 - repair is best-effort
@@ -1382,6 +1392,7 @@ def _call_openai_compat(
             max_completion_tokens=max_completion_tokens,
             backend=backend,
             response_format=effective_response_format if response_format_used else None,
+            extra_body=kwargs.get("extra_body"),
         )
         input_tokens += repair_input
         output_tokens += repair_output

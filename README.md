@@ -659,19 +659,20 @@ OPENROUTER_API_KEY=... graphify extract . --backend openrouter
 
 `--require-parameters` stores `extra_body.provider.require_parameters=true`, which helps avoid silent routing to providers that ignore structured-output parameters. `--response-healing` stores `extra_body.plugins=[{"id":"response-healing"}]`. OpenRouter structured outputs still require a compatible model/provider; use `--response-format json_object` or `off` if a provider rejects schema mode.
 
-For cheaper or smaller models (e.g. `deepseek/deepseek-v4-flash`) on doc-heavy corpora (many `.md` / `.agents/spec/` files), graphify automatically caps chunk size by estimated output tokens and uses a compact extraction prompt. You can tune further:
+For DeepSeek v4-flash on doc-heavy corpora (many `.md` / `.agents/spec/` files), graphify uses the full extraction prompt, disables DeepSeek thinking mode, and defaults the DeepSeek output cap to 32768 tokens. Tune for output headroom first, not tiny input chunks:
 
 ```bash
-# Recommended for deepseek-v4-flash on large doc trees
-export GRAPHIFY_MAX_OUTPUT_TOKENS=16384
-graphify extract . --backend openrouter --model deepseek/deepseek-v4-flash \
-  --token-budget 6000 --max-files-per-chunk 6 --max-concurrency 2 \
+# Recommended for deepseek-v4-flash parity on large doc trees
+graphify extract . --backend deepseek \
+  --token-budget 40000 --max-files-per-chunk 8 --max-concurrency 2 \
   --rate-limit-max-wait 600 --rate-limit-max-total-wait 3600
 ```
 
+For OpenRouter or a custom provider routing to `deepseek/deepseek-v4-flash`, set `GRAPHIFY_MAX_OUTPUT_TOKENS=32768` unless that provider config already has an equivalent `max_tokens` value. Legacy small models (`7b`, `mini`, `lite`, `haiku`, and non-v4 `flash` models) still use the compact extraction prompt; for those, smaller chunks such as `--token-budget 6000 --max-files-per-chunk 6` can reduce truncation.
+
 On HTTP 429 (rate limit), graphify waits and retries automatically — respecting `Retry-After` when the provider sends it. Use `--max-concurrency 2` with rate-limit retry for doc-heavy corpora on OpenRouter/DeepSeek.
 
-`GRAPHIFY_MAX_OUTPUT_TOKENS` raises the per-request output cap (default follows the backend, typically 16384). `--token-budget` limits input tokens per chunk; `--max-files-per-chunk` overrides the default file cap (8 docs / 20 code).
+`GRAPHIFY_MAX_OUTPUT_TOKENS` raises the per-request output cap (default follows the backend: DeepSeek 32768, most others 16384). `--token-budget` limits input tokens per chunk; `--max-files-per-chunk` overrides the default file cap (8 docs / 20 code).
 
 ---
 
