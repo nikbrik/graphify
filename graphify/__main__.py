@@ -2188,6 +2188,7 @@ def main() -> None:
         print("    --token-budget N        per-chunk token cap for semantic extraction (default: 60000)")
         print("    --max-concurrency N     parallel semantic chunks in flight (default: 4; set 1 for local LLMs)")
         print("    --max-files-per-chunk N cap files per semantic chunk (default: 8 docs, 20 code)")
+        print("    --exclude PATTERN       exclude gitignore-style path pattern from scan and extracted graph")
         print("    --api-timeout S         per-request timeout in seconds for the LLM client (default: 600)")
         print("    --rate-limit-max-wait S max seconds to wait per rate-limit retry (default: 600)")
         print("    --rate-limit-max-total-wait S max total wait per API call across retries (default: 3600)")
@@ -3287,7 +3288,7 @@ def main() -> None:
             )
         _raw = json.loads(graph_json.read_text(encoding="utf-8"))
         _directed = bool(_raw.get("directed", False))
-        G = build_from_json(_raw, directed=_directed)
+        G = build_from_json(_raw, directed=_directed, canonicalize_ghosts=False)
         print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
         print("Re-clustering...")
         communities = cluster(G, resolution=co_resolution, exclude_hubs_percentile=co_exclude_hubs)
@@ -3329,7 +3330,22 @@ def main() -> None:
                 G, communities, backend=label_backend, model=label_model, gods=gods
             )
         questions = suggest_questions(G, communities, labels)
-        tokens = {"input": 0, "output": 0}
+        tokens = {
+            "input": int(_raw.get("input_tokens", 0) or 0),
+            "output": int(_raw.get("output_tokens", 0) or 0),
+        }
+        analysis_path = out / ".graphify_analysis.json"
+        if analysis_path.exists():
+            try:
+                analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+                analysis_tokens = analysis.get("tokens") or {}
+                if isinstance(analysis_tokens, dict):
+                    tokens = {
+                        "input": int(analysis_tokens.get("input", tokens["input"]) or 0),
+                        "output": int(analysis_tokens.get("output", tokens["output"]) or 0),
+                    }
+            except Exception:
+                pass
         from graphify.export import _git_head as _gh
         _commit = _gh()
         report = generate(G, communities, cohesion, labels, gods, surprises,
@@ -3339,7 +3355,8 @@ def main() -> None:
         (out / "GRAPH_REPORT.md").write_text(report, encoding="utf-8")
         from graphify.export import backup_if_protected as _backup
         _backup(out)
-        to_json(G, communities, str(out / "graph.json"), community_labels=labels)
+        graph_written = to_json(G, communities, str(out / "graph.json"), community_labels=labels)
+        graph_status = "graph.json updated" if graph_written else "graph.json skipped (refused overwrite)"
         labels_path.write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding="utf-8")
 
         # Mirror watch.py pattern: gate to_html so core outputs (graph.json +
@@ -3350,7 +3367,7 @@ def main() -> None:
         if no_viz:
             if html_target.exists():
                 html_target.unlink()
-            print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated (--no-viz; graph.html removed).")
+            print(f"Done - {len(communities)} communities. GRAPH_REPORT.md updated; {graph_status} (--no-viz; graph.html removed).")
         else:
             try:
                 # Over-cap fallback (#1019): force the community-aggregation
@@ -3358,12 +3375,12 @@ def main() -> None:
                 _node_limit = 5000 if _over_cap else None
                 to_html(G, communities, str(html_target), community_labels=labels or None,
                         node_limit=_node_limit)
-                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md, graph.json and graph.html updated.")
+                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md updated; {graph_status}; graph.html updated.")
             except ValueError as viz_err:
                 if html_target.exists():
                     html_target.unlink()
                 print(f"Skipped graph.html: {viz_err}")
-                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md and graph.json updated.")
+                print(f"Done - {len(communities)} communities. GRAPH_REPORT.md updated; {graph_status}.")
 
     elif cmd == "update":
         force = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
@@ -4013,7 +4030,7 @@ def main() -> None:
                 "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama|bedrock|claude-cli|codex-cli] "
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
-                "[--max-files-per-chunk N] "
+                "[--max-files-per-chunk N] [--exclude PATTERN] "
                 "[--api-timeout S] [--rate-limit-max-wait S] [--rate-limit-max-total-wait S] "
                 "[--rate-limit-retries N] [--no-rate-limit-retry] [--postgres DSN] [--cargo]",
                 file=sys.stderr,
@@ -4516,6 +4533,46 @@ def main() -> None:
             "input_tokens": ast_result.get("input_tokens", 0) + sem_result.get("input_tokens", 0),
             "output_tokens": ast_result.get("output_tokens", 0) + sem_result.get("output_tokens", 0),
         }
+        if cli_excludes:
+            from graphify.detect import (
+                compile_exclude_patterns as _compile_exclude_patterns,
+                is_excluded_path as _is_excluded_path,
+            )
+            _exclude_patterns = _compile_exclude_patterns(target, cli_excludes)
+            _exclude_cache: dict[Path, bool] = {}
+
+            def _excluded_source(source: object) -> bool:
+                return _is_excluded_path(
+                    source if isinstance(source, (str, Path)) else None,
+                    target,
+                    patterns=_exclude_patterns,
+                    _cache=_exclude_cache,
+                )
+
+            removed_node_ids = {
+                str(n.get("id"))
+                for n in merged["nodes"]
+                if n.get("id") is not None and _excluded_source(n.get("source_file"))
+            }
+            if removed_node_ids:
+                merged["nodes"] = [
+                    n for n in merged["nodes"]
+                    if str(n.get("id")) not in removed_node_ids
+                ]
+            before_edges = len(merged["edges"])
+            merged["edges"] = [
+                e for e in merged["edges"]
+                if str(e.get("source", e.get("from", ""))) not in removed_node_ids
+                and str(e.get("target", e.get("to", ""))) not in removed_node_ids
+                and not _excluded_source(e.get("source_file"))
+            ]
+            if removed_node_ids or before_edges != len(merged["edges"]):
+                print(
+                    f"[graphify extract] --exclude pruned "
+                    f"{len(removed_node_ids)} node(s), "
+                    f"{before_edges - len(merged['edges'])} edge(s)",
+                    file=sys.stderr,
+                )
 
         graph_json_path = graphify_out / "graph.json"
         analysis_path = graphify_out / ".graphify_analysis.json"

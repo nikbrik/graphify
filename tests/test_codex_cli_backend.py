@@ -6,13 +6,14 @@ the `codex` binary or a live network call.
 from __future__ import annotations
 
 import json
-import os
+from concurrent.futures import Future
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from graphify import llm
+from graphify import rate_limit
 
 _VALID_EXTRACTION = {
     "nodes": [
@@ -256,16 +257,118 @@ def test_model_from_default_backend_config(monkeypatch, fake_codex, tmp_path):
     assert argv[argv.index("-m") + 1] == "gpt-5.4-codex"
 
 
-def test_serial_by_default_respects_env(monkeypatch):
-    monkeypatch.delenv("GRAPHIFY_CODEX_CLI_PARALLEL", raising=False)
-    max_concurrency = 8
-    backend = "codex-cli"
-    if backend == "codex-cli" and os.environ.get("GRAPHIFY_CODEX_CLI_PARALLEL", "").strip() != "1":
-        max_concurrency = 1
-    assert max_concurrency == 1
+def _write_parallel_files(tmp_path, count=3):
+    files = []
+    for i in range(count):
+        path = tmp_path / f"doc{i}.md"
+        path.write_text(f"# Doc {i}\n")
+        files.append(path)
+    return files
 
+
+def _fake_chunk_result(chunk):
+    name = Path(chunk[0]).stem
+    return {
+        "nodes": [{"id": name, "label": name, "file_type": "document", "source_file": f"{name}.md"}],
+        "edges": [],
+        "hyperedges": [],
+        "input_tokens": 1,
+        "output_tokens": 1,
+    }
+
+
+def test_extract_corpus_parallel_codex_cli_serial_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("GRAPHIFY_CODEX_CLI_PARALLEL", raising=False)
+    files = _write_parallel_files(tmp_path)
+    calls = []
+
+    def fake_adaptive(chunk, **kwargs):
+        calls.append([p.name for p in chunk])
+        return _fake_chunk_result(chunk)
+
+    def forbidden_pool(*args, **kwargs):
+        raise AssertionError("codex-cli default path must be serial")
+
+    monkeypatch.setattr(llm, "_extract_with_adaptive_retry", fake_adaptive)
+    monkeypatch.setattr(llm, "ThreadPoolExecutor", forbidden_pool)
+
+    result = llm.extract_corpus_parallel(
+        files,
+        backend="codex-cli",
+        root=tmp_path,
+        token_budget=None,
+        chunk_size=1,
+        max_concurrency=3,
+    )
+
+    assert calls == [["doc0.md"], ["doc1.md"], ["doc2.md"]]
+    assert len(result["nodes"]) == 3
+
+
+def test_extract_corpus_parallel_codex_cli_parallel_opt_in(monkeypatch, tmp_path):
+    files = _write_parallel_files(tmp_path)
     monkeypatch.setenv("GRAPHIFY_CODEX_CLI_PARALLEL", "1")
-    max_concurrency = 8
-    if backend == "codex-cli" and os.environ.get("GRAPHIFY_CODEX_CLI_PARALLEL", "").strip() != "1":
-        max_concurrency = 1
-    assert max_concurrency == 8
+    created_workers = []
+
+    class FakePool:
+        def __init__(self, max_workers):
+            created_workers.append(max_workers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            fut = Future()
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except BaseException as exc:
+                fut.set_exception(exc)
+            return fut
+
+    monkeypatch.setattr(llm, "_extract_with_adaptive_retry", lambda chunk, **kwargs: _fake_chunk_result(chunk))
+    monkeypatch.setattr(llm, "ThreadPoolExecutor", FakePool)
+
+    result = llm.extract_corpus_parallel(
+        files,
+        backend="codex-cli",
+        root=tmp_path,
+        token_budget=None,
+        chunk_size=1,
+        max_concurrency=3,
+    )
+
+    assert created_workers == [3]
+    assert len(result["nodes"]) == 3
+
+
+def test_extract_corpus_parallel_retry_accounting_preserves_chunks(monkeypatch, tmp_path, capsys):
+    files = _write_parallel_files(tmp_path)
+    monkeypatch.delenv("GRAPHIFY_CODEX_CLI_PARALLEL", raising=False)
+    calls = {"n": 0}
+
+    def fake_adaptive(chunk, **kwargs):
+        if calls["n"] == 0:
+            rate_limit._record_thread_retry(0.0)
+            rate_limit._record_global_retry(0.0)
+        calls["n"] += 1
+        return _fake_chunk_result(chunk)
+
+    monkeypatch.setattr(llm, "_extract_with_adaptive_retry", fake_adaptive)
+
+    result = llm.extract_corpus_parallel(
+        files,
+        backend="codex-cli",
+        root=tmp_path,
+        token_budget=None,
+        chunk_size=1,
+        max_concurrency=3,
+    )
+
+    assert len(result["nodes"]) == 3
+    assert result["failed_chunks"] == 0
+    assert result["rate_limit_retries"] == 1
+    assert result["rate_limit_recovered_chunks"] == 1
+    assert "1 chunk(s) recovered after 1 retries" in capsys.readouterr().err

@@ -118,6 +118,27 @@ def test_score_nodes_multiword_exact_label_outranks_superset():
     assert scored[0][0] > scored[1][0], "exact label must strictly outrank superset/token-bag matches"
 
 
+def test_score_nodes_boosts_koin_dependency_injection_startup_wiring():
+    G = nx.Graph()
+    G.add_node("startup_koin", label="Startup/Koin", source_file="docs/startup.md", community=0)
+    G.add_node("root_component", label="RootComponent", source_file="shared/src/commonMain/kotlin/root/RootComponent.kt", community=0)
+    G.add_node("init_koin", label="initKoin", source_file="shared/src/commonMain/kotlin/di/Koin.kt", community=1)
+    G.add_node("platform_start_koin", label="platformStartKoin", source_file="shared/src/androidMain/kotlin/di/PlatformKoin.kt", community=1)
+    G.add_node("mobile_agent_on_create", label="MobileAgentApp.onCreate", source_file="android/app/src/main/java/MobileAgentApp.kt", community=1)
+    G.add_edge("mobile_agent_on_create", "platform_start_koin", relation="calls", context="call")
+    G.add_edge("platform_start_koin", "init_koin", relation="calls", context="call")
+    G.add_edge("root_component", "startup_koin", relation="references", context="reference")
+
+    scored = _score_nodes(
+        G,
+        _query_terms("Where is Koin dependency injection startup wired?"),
+    )
+    top = [nid for _, nid in scored[:3]]
+
+    assert top == ["init_koin", "platform_start_koin", "mobile_agent_on_create"]
+    assert [nid for _, nid in scored].index("startup_koin") > 2
+
+
 def test_find_node_ignores_trailing_punctuation():
     G = _make_graph()
     assert _find_node(G, "extract?") == ["n1"]

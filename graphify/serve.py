@@ -64,6 +64,16 @@ def _search_tokens(text: str) -> list[str]:
     return re.findall(r"\w+", _strip_diacritics(str(text)).lower())
 
 
+def _identifier_tokens(text: str | None) -> list[str]:
+    """Split code-ish identifiers and paths into searchable tokens."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"[\\/._:\-]+", " ", text)
+    return _search_tokens(text)
+
+
 def _has_chinese(text: str) -> bool:
     return any("一" <= ch <= "鿿" for ch in text)
 
@@ -107,6 +117,35 @@ _EXACT_MATCH_BONUS = 1000.0
 _PREFIX_MATCH_BONUS = 100.0
 _SUBSTRING_MATCH_BONUS = 1.0
 _SOURCE_MATCH_BONUS = 0.5
+_IDENTIFIER_MATCH_BONUS = 40.0
+_SOURCE_TOKEN_MATCH_BONUS = 3.0
+_DI_BOOTSTRAP_TERMS = frozenset({
+    "di",
+    "dependency",
+    "injection",
+    "startup",
+    "bootstrap",
+    "koin",
+    "init",
+    "start",
+    "wire",
+    "wired",
+    "wiring",
+})
+_BOOTSTRAP_SYMBOL_TERMS = frozenset({
+    "init",
+    "start",
+    "startup",
+    "bootstrap",
+    "koin",
+    "oncreate",
+    "create",
+})
+_CODE_SUFFIXES = frozenset({
+    ".c", ".cc", ".cpp", ".cs", ".dart", ".go", ".java", ".js", ".jsx",
+    ".kt", ".kts", ".m", ".mm", ".php", ".py", ".rb", ".rs", ".scala",
+    ".swift", ".ts", ".tsx",
+})
 
 
 def _compute_idf(G: nx.Graph, terms: list[str]) -> dict[str, float]:
@@ -138,6 +177,9 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
     scored = []
     norm_terms = [tok for t in terms for tok in _search_tokens(t)]
     idf = _compute_idf(G, norm_terms)
+    query_term_set = set(norm_terms)
+    domain_query = bool(query_term_set & _DI_BOOTSTRAP_TERMS)
+    domain_weight = max((idf.get(t, 1.0) for t in query_term_set & _DI_BOOTSTRAP_TERMS), default=1.0)
     # Whole-query string for full-label matching (mirrors _find_node's `term`).
     joined = " ".join(norm_terms)
     # Weight the full-query bonus by the rarest constituent term so a specific
@@ -153,6 +195,12 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
         # driver".
         label_tokens = " ".join(_search_tokens(data.get("label") or ""))
         source = (data.get("source_file") or "").lower()
+        id_parts = set(_identifier_tokens(nid))
+        label_parts = set(_identifier_tokens(data.get("label") or ""))
+        source_parts = set(_identifier_tokens(source))
+        stem_parts = set(_identifier_tokens(Path(source).stem if source else ""))
+        path_parts = set(source.replace("\\", "/").split("/")) if source else set()
+        symbol_parts = id_parts | label_parts
         score = 0.0
         # Full-query tier: a multi-word query that equals (or prefixes) the whole
         # label must dominate the per-token bag-of-words sums below, so `path`/
@@ -182,6 +230,55 @@ def _score_nodes(G: nx.Graph, terms: list[str]) -> list[tuple[float, str]]:
                 score += _SUBSTRING_MATCH_BONUS * w
             if t in source:
                 score += _SOURCE_MATCH_BONUS * w
+            if t in id_parts or t in label_parts:
+                score += _IDENTIFIER_MATCH_BONUS * w
+            elif any(part.startswith(t) for part in id_parts | label_parts):
+                score += (_IDENTIFIER_MATCH_BONUS * 0.35) * w
+            if t in source_parts or t in stem_parts:
+                score += _SOURCE_TOKEN_MATCH_BONUS * w
+            elif any(part.startswith(t) for part in source_parts | stem_parts):
+                score += (_SOURCE_TOKEN_MATCH_BONUS * 0.5) * w
+        if domain_query:
+            symbol_hits = len(symbol_parts & _BOOTSTRAP_SYMBOL_TERMS)
+            source_hits = len(source_parts & _DI_BOOTSTRAP_TERMS)
+            if symbol_hits:
+                score += 24.0 * symbol_hits * domain_weight
+            if source_hits:
+                score += 10.0 * source_hits * domain_weight
+            if "di" in path_parts:
+                score += 60.0 * domain_weight
+            if Path(source).suffix.lower() in _CODE_SUFFIXES:
+                score += 8.0 * domain_weight
+            call_bonus = 0.0
+            neighbors = set(G.neighbors(nid))
+            if G.is_directed():
+                try:
+                    neighbors.update(G.predecessors(nid))  # type: ignore[attr-defined]
+                except AttributeError:
+                    pass
+            for nbr in neighbors:
+                edge_attrs = None
+                if G.has_edge(nid, nbr):
+                    edge_attrs = edge_data(G, nid, nbr)
+                elif G.has_edge(nbr, nid):
+                    edge_attrs = edge_data(G, nbr, nid)
+                if not edge_attrs:
+                    continue
+                rel = str(edge_attrs.get("relation", "")).lower()
+                ctx = str(edge_attrs.get("context", "")).lower()
+                if rel != "calls" and "call" not in ctx:
+                    continue
+                nbr_data = G.nodes[nbr]
+                nbr_parts = (
+                    set(_identifier_tokens(nbr))
+                    | set(_identifier_tokens(nbr_data.get("label") or ""))
+                    | set(_identifier_tokens(nbr_data.get("source_file") or ""))
+                )
+                query_hits = len(nbr_parts & query_term_set)
+                domain_hits = len(nbr_parts & _DI_BOOTSTRAP_TERMS)
+                if query_hits or domain_hits:
+                    call_bonus += (70.0 * query_hits + 55.0 * domain_hits) * domain_weight
+            score += call_bonus
         if score > 0:
             scored.append((score, nid))
     # Sort by score desc; break ties toward the shorter label so a concise exact

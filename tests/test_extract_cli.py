@@ -1,6 +1,8 @@
 """Tests for `graphify extract` CLI dispatch path in graphify.__main__."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import graphify.__main__ as mainmod
@@ -235,3 +237,128 @@ def test_extract_without_key_still_errors_when_docs_present(
     assert "no LLM API key found" in err
     assert "code-only corpus needs no key" in err
     assert not (out_dir / "graphify-out" / "graph.json").exists()
+
+
+def test_extract_help_usage_documents_exclude(monkeypatch, capsys):
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(mainmod.sys, "argv", ["graphify", "extract"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        mainmod.main()
+
+    assert exc_info.value.code == 1
+    assert "--exclude PATTERN" in capsys.readouterr().err
+
+
+def test_extract_exclude_prunes_semantic_reference_nodes_and_edges(monkeypatch, tmp_path, capsys):
+    corpus = tmp_path / "corpus"
+    excluded = corpus / ".agents" / "skills" / "task-author"
+    excluded.mkdir(parents=True)
+    (excluded / "SKILL.md").write_text("# Task Author\n")
+    (corpus / "README.md").write_text("# Notes\nReferences task author skill.\n")
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+
+    def _semantic_with_excluded_reference(paths, **kwargs):
+        on_chunk = kwargs.get("on_chunk_done")
+        result = {
+            "nodes": [
+                {"id": "readme", "label": "README", "file_type": "document",
+                 "source_file": "README.md"},
+                {"id": "task_author_skill", "label": "Task Author Skill",
+                 "file_type": "document",
+                 "source_file": ".agents/skills/task-author/SKILL.md"},
+            ],
+            "edges": [
+                {"source": "readme", "target": "task_author_skill",
+                 "relation": "references", "confidence": "EXTRACTED",
+                 "source_file": "README.md", "weight": 1.0},
+                {"source": "task_author_skill", "target": "readme",
+                 "relation": "references", "confidence": "EXTRACTED",
+                 "source_file": ".agents/skills/task-author/SKILL.md", "weight": 1.0},
+            ],
+            "hyperedges": [],
+            "input_tokens": 11,
+            "output_tokens": 7,
+        }
+        if on_chunk:
+            on_chunk(0, 1, result)
+        return result
+
+    monkeypatch.setattr(
+        "graphify.llm.extract_corpus_parallel",
+        _semantic_with_excluded_reference,
+    )
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        [
+            "graphify", "extract", str(corpus), "--backend", "claude",
+            "--out", str(out_dir), "--exclude", ".agents/skills",
+            "--no-cluster",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        mainmod.main()
+    assert exc_info.value.code == 0
+
+    graph_json = out_dir / "graphify-out" / "graph.json"
+    graph = json.loads(graph_json.read_text())
+    node_sources = {n.get("source_file") for n in graph["nodes"]}
+    assert ".agents/skills/task-author/SKILL.md" not in node_sources
+    node_ids = {n["id"] for n in graph["nodes"]}
+    assert "task_author_skill" not in node_ids
+    assert all(
+        e.get("source") in node_ids and e.get("target") in node_ids
+        for e in graph["edges"]
+    )
+    assert all(".agents/skills" not in (e.get("source_file") or "") for e in graph["edges"])
+    manifest = (out_dir / "graphify-out" / "manifest.json").read_text()
+    assert ".agents/skills" not in manifest
+
+    capsys.readouterr()
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "query", "Task Author Skill", "--graph", str(graph_json)],
+    )
+    mainmod.main()
+    assert ".agents/skills" not in capsys.readouterr().out
+
+
+def test_cluster_only_refused_graph_write_does_not_claim_updated(monkeypatch, tmp_path, capsys):
+    project = tmp_path / "project"
+    out = project / "graphify-out"
+    out.mkdir(parents=True)
+    graph = {
+        "directed": False,
+        "nodes": [
+            {"id": "a", "label": "A", "file_type": "concept", "source_file": "a.md", "community": 0},
+            {"id": "b", "label": "B", "file_type": "concept", "source_file": "b.md", "community": 1},
+        ],
+        "links": [],
+    }
+    (out / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    (out / ".graphify_analysis.json").write_text(
+        json.dumps({"tokens": {"input": 1234, "output": 5678}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("graphify.export.to_json", lambda *args, **kwargs: False)
+    monkeypatch.setattr("graphify.export._git_head", lambda: None)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "cluster-only", str(project), "--no-viz", "--no-label"],
+    )
+
+    mainmod.main()
+
+    stdout = capsys.readouterr().out
+    assert "GRAPH_REPORT.md updated" in stdout
+    assert "graph.json skipped" in stdout
+    assert "graph.json updated" not in stdout
+    report = (out / "GRAPH_REPORT.md").read_text(encoding="utf-8")
+    assert "Token cost: 1,234 input · 5,678 output" in report

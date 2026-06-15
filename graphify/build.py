@@ -104,13 +104,22 @@ def edge_datas(G: nx.Graph, u: str, v: str) -> list[dict]:
     return [raw]
 
 
-def build_from_json(extraction: dict, *, directed: bool = False, root: str | Path | None = None) -> nx.Graph:
+def build_from_json(
+    extraction: dict,
+    *,
+    directed: bool = False,
+    root: str | Path | None = None,
+    canonicalize_ghosts: bool = True,
+) -> nx.Graph:
     """Build a NetworkX graph from an extraction dict.
 
     directed=True produces a DiGraph that preserves edge direction (source→target).
     directed=False (default) produces an undirected Graph for backward compatibility.
     root: if given, absolute source_file paths from semantic subagents are made
         relative to root so all nodes share a consistent path key (#932).
+    canonicalize_ghosts: when True, merge semantic ghost nodes into AST
+        canonical nodes. Load-only round trips can disable this to preserve the
+        serialized graph exactly.
     """
     _root = str(Path(root).resolve()) if root else None
     # NetworkX <= 3.1 serialised edges as "links"; remap to "edges" for compatibility.
@@ -157,6 +166,8 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         G.add_node(node["id"], **{k: v for k, v in node.items() if k != "id"})
     node_set = set(G.nodes())
 
+    _ghost_remap: dict[str, str] = {}  # ghost_id -> canonical_id
+
     # #1145 (extended): merge LLM ghost-duplicate nodes into AST canonical nodes.
     # Original bug: AST uses parent-qualified IDs (mingpt_bpe_get_pairs) while LLM
     # uses bare-stem IDs (bpe_get_pairs) — different IDs, same symbol.
@@ -164,60 +175,60 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
     # populates source_location, so those ghosts survived. Extended fix: use
     # _origin=="ast" as the canonical signal. AST nodes always win; any non-AST
     # node sharing (basename, label) with an AST node is a ghost.
-    _loc_nodes: dict[tuple[str, str], str] = {}   # (basename, label) -> canonical node id
-    _loc_collisions: set[tuple[str, str]] = set()  # keys shared by 2+ AST nodes
-    _noloc_nodes: dict[tuple[str, str], str] = {}  # (basename, label) -> ghost node id
+    if canonicalize_ghosts:
+        _loc_nodes: dict[tuple[str, str], str] = {}   # (basename, label) -> canonical node id
+        _loc_collisions: set[tuple[str, str]] = set()  # keys shared by 2+ AST nodes
+        _noloc_nodes: dict[tuple[str, str], str] = {}  # (basename, label) -> ghost node id
 
-    # Pass 1: collect canonical nodes — AST-origin nodes take precedence over LLM nodes.
-    # When 2+ AST nodes share a key (same-named symbols in same-named files across
-    # directories, e.g. render in two index.ts), the key is ambiguous: merging a
-    # ghost would pick an arbitrary winner via set-iteration order (#1257). Track
-    # those keys so Pass 2 skips them — same conservatism as
-    # _rewire_unique_stub_nodes, which only merges when exactly one real def exists.
-    for nid in node_set:
-        attrs = G.nodes[nid]
-        label = str(attrs.get("label", "")).strip()
-        sf = str(attrs.get("source_file", ""))
-        basename = Path(sf).name if sf else ""
-        if not label or not basename:
-            continue
-        is_ast = attrs.get("_origin") == "ast"
-        if attrs.get("source_location") or is_ast:
+        # Pass 1: collect canonical nodes — AST-origin nodes take precedence over LLM nodes.
+        # When 2+ AST nodes share a key (same-named symbols in same-named files across
+        # directories, e.g. render in two index.ts), the key is ambiguous: merging a
+        # ghost would pick an arbitrary winner via set-iteration order (#1257). Track
+        # those keys so Pass 2 skips them — same conservatism as
+        # _rewire_unique_stub_nodes, which only merges when exactly one real def exists.
+        for nid in node_set:
+            attrs = G.nodes[nid]
+            label = str(attrs.get("label", "")).strip()
+            sf = str(attrs.get("source_file", ""))
+            basename = Path(sf).name if sf else ""
+            if not label or not basename:
+                continue
+            is_ast = attrs.get("_origin") == "ast"
+            if attrs.get("source_location") or is_ast:
+                key = (basename, label)
+                if is_ast:
+                    # Two AST nodes on the same key is an ambiguous collision.
+                    if key in _loc_nodes and G.nodes[_loc_nodes[key]].get("_origin") == "ast":
+                        _loc_collisions.add(key)
+                    # AST-origin nodes always overwrite a prior non-AST entry.
+                    _loc_nodes[key] = nid
+                elif key not in _loc_nodes:
+                    _loc_nodes[key] = nid
+
+        # Pass 2: find ghosts — non-AST nodes that have an AST canonical twin.
+        for nid in node_set:
+            attrs = G.nodes[nid]
+            if attrs.get("_origin") == "ast":
+                continue  # AST nodes are never ghosts
+            label = str(attrs.get("label", "")).strip()
+            sf = str(attrs.get("source_file", ""))
+            basename = Path(sf).name if sf else ""
+            if not label or not basename:
+                continue
             key = (basename, label)
-            if is_ast:
-                # Two AST nodes on the same key is an ambiguous collision.
-                if key in _loc_nodes and G.nodes[_loc_nodes[key]].get("_origin") == "ast":
-                    _loc_collisions.add(key)
-                # AST-origin nodes always overwrite a prior non-AST entry.
-                _loc_nodes[key] = nid
-            elif key not in _loc_nodes:
-                _loc_nodes[key] = nid
-
-    # Pass 2: find ghosts — non-AST nodes that have an AST canonical twin.
-    for nid in node_set:
-        attrs = G.nodes[nid]
-        if attrs.get("_origin") == "ast":
-            continue  # AST nodes are never ghosts
-        label = str(attrs.get("label", "")).strip()
-        sf = str(attrs.get("source_file", ""))
-        basename = Path(sf).name if sf else ""
-        if not label or not basename:
-            continue
-        key = (basename, label)
-        if key in _loc_collisions:
-            continue  # ambiguous key: no safe canonical winner, leave ghost intact
-        if key in _loc_nodes and _loc_nodes[key] != nid:
-            _noloc_nodes[key] = nid
-    # For every ghost that has an AST counterpart, record a remap.
-    _ghost_remap: dict[str, str] = {}  # ghost_id -> canonical_id
-    for key, sem_id in _noloc_nodes.items():
-        ast_id = _loc_nodes.get(key)
-        if ast_id is not None:
-            _ghost_remap[sem_id] = ast_id
-    # Remove ghost nodes from the graph; edges will be re-pointed via norm_to_id.
-    for ghost_id in _ghost_remap:
-        G.remove_node(ghost_id)
-        node_set.discard(ghost_id)
+            if key in _loc_collisions:
+                continue  # ambiguous key: no safe canonical winner, leave ghost intact
+            if key in _loc_nodes and _loc_nodes[key] != nid:
+                _noloc_nodes[key] = nid
+        # For every ghost that has an AST counterpart, record a remap.
+        for key, sem_id in _noloc_nodes.items():
+            ast_id = _loc_nodes.get(key)
+            if ast_id is not None:
+                _ghost_remap[sem_id] = ast_id
+        # Remove ghost nodes from the graph; edges will be re-pointed via norm_to_id.
+        for ghost_id in _ghost_remap:
+            G.remove_node(ghost_id)
+            node_set.discard(ghost_id)
 
     # Normalized ID map: lets edges survive when the LLM generates IDs with
     # slightly different casing or punctuation than the AST extractor.

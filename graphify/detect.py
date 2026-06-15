@@ -770,6 +770,31 @@ def _load_graphifyignore(root: Path) -> list[tuple[Path, str]]:
     return patterns
 
 
+def _compile_ignore_patterns(
+    root: Path,
+    extra_excludes: list[str] | None = None,
+) -> list[tuple[Path, str]]:
+    """Return scan ignore patterns plus CLI --exclude patterns."""
+    root = root.resolve()
+    patterns = list(_load_graphifyignore(root))
+    # CLI --exclude patterns are anchored at the scan root and appended last
+    # so they win over any .graphifyignore/.gitignore rules (#947).
+    if extra_excludes:
+        for pat in extra_excludes:
+            line = _parse_gitignore_line(pat)
+            if line:
+                patterns.append((root, line))
+    return patterns
+
+
+def compile_exclude_patterns(
+    root: Path,
+    extra_excludes: list[str] | None = None,
+) -> list[tuple[Path, str]]:
+    """Compile the path exclusion rules used by scan and extracted graph filtering."""
+    return _compile_ignore_patterns(root, extra_excludes)
+
+
 def _is_ignored(
     path: Path,
     root: Path,
@@ -862,6 +887,26 @@ def _is_ignored(
         if _eval(ancestor):
             return True
     return _eval(path)
+
+
+def is_excluded_path(
+    path: str | Path | None,
+    root: str | Path,
+    *,
+    patterns: list[tuple[Path, str]] | None = None,
+    extra_excludes: list[str] | None = None,
+    _cache: dict[Path, bool] | None = None,
+) -> bool:
+    """Apply graphify's ignore matcher to a path from scan or extracted graph data."""
+    if not path:
+        return False
+    root_path = Path(root).resolve()
+    raw = str(path).replace("\\", "/")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = root_path / candidate
+    compiled = patterns if patterns is not None else _compile_ignore_patterns(root_path, extra_excludes)
+    return _is_ignored(candidate, root_path, compiled, _cache=_cache)
 
 
 def _load_graphifyinclude(root: Path) -> list[tuple[Path, str]]:
@@ -1009,15 +1054,8 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
     total_words = 0
 
     skipped_sensitive: list[str] = []
-    ignore_patterns = _load_graphifyignore(root)
+    ignore_patterns = _compile_ignore_patterns(root, extra_excludes)
     ignore_cache: dict[Path, bool] = {}  # shared across all _is_ignored calls in this scan
-    # CLI --exclude patterns are anchored at the scan root and appended last
-    # so they win over any .graphifyignore/.gitignore rules (#947).
-    if extra_excludes:
-        for pat in extra_excludes:
-            line = _parse_gitignore_line(pat)
-            if line:
-                ignore_patterns.append((root, line))
     include_patterns = _load_graphifyinclude(root)
 
     # Always include graphify-out/memory/ - query results filed back into the graph

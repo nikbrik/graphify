@@ -170,6 +170,23 @@ def test_ghost_merge_unique_located_node_still_merges():
     assert G.has_edge("caller", "ast_render")
 
 
+def test_build_from_json_can_preserve_ghost_nodes_without_canonicalization():
+    ext = {
+        "nodes": [
+            {"id": "ast_render", "label": "render", "file_type": "code",
+             "source_file": "src/app/index.ts", "source_location": "L10", "_origin": "ast"},
+            {"id": "ghost_render", "label": "render", "file_type": "code",
+             "source_file": "src/app/index.ts"},
+        ],
+        "edges": [{"source": "ghost_render", "target": "ast_render", "relation": "references",
+                   "confidence": "EXTRACTED", "source_file": "src/app/index.ts", "weight": 1.0}],
+        "input_tokens": 0, "output_tokens": 0,
+    }
+    G = build_from_json(ext, canonicalize_ghosts=False)
+    assert set(G.nodes()) == {"ast_render", "ghost_render"}
+    assert G.has_edge("ghost_render", "ast_render")
+
+
 def test_ghost_merge_skipped_on_basename_collision():
     """#1257: when two files with the same basename both define a symbol with the
     same label, the (basename, label) key is ambiguous and the semantic ghost

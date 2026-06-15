@@ -21,6 +21,28 @@ def test_cluster_covers_all_nodes():
     all_nodes = {n for nodes in communities.values() for n in nodes}
     assert all_nodes == set(G.nodes)
 
+
+def test_cluster_round_trip_preserves_isolated_and_ghost_like_nodes():
+    ext = {
+        "nodes": [
+            {"id": "ast_render", "label": "render", "file_type": "code",
+             "source_file": "src/app/index.ts", "source_location": "L10", "_origin": "ast"},
+            {"id": "ghost_render", "label": "render", "file_type": "code",
+             "source_file": "src/app/index.ts"},
+            {"id": "isolated_doc", "label": "Isolated Doc", "file_type": "document",
+             "source_file": "docs/isolated.md"},
+        ],
+        "edges": [],
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    G = build_from_json(ext, canonicalize_ghosts=False)
+    before = G.number_of_nodes()
+    communities = cluster(G)
+    all_nodes = {n for nodes in communities.values() for n in nodes}
+    assert G.number_of_nodes() == before == len(ext["nodes"])
+    assert all_nodes == set(G.nodes)
+
 def test_cohesion_score_complete_graph():
     G = nx.complete_graph(4)
     G = nx.relabel_nodes(G, {i: str(i) for i in G.nodes})
