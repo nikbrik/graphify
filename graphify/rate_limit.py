@@ -207,16 +207,34 @@ _NON_RETRYABLE_STATUS = frozenset({400, 401, 403, 404})
 _TIMEOUT_MARKERS = ("timeout", "timed out", "read timeout", "connect timeout")
 
 
+def _coerce_http_status(code) -> int | None:
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str):
+        text = code.strip()
+        if text.isdigit():
+            return int(text)
+        match = re.match(r"(\d{3})", text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def _exception_status_code(exc: BaseException) -> int | None:
     for attr in ("status_code", "http_status", "status"):
-        code = getattr(exc, attr, None)
-        if isinstance(code, int):
-            return code
+        parsed = _coerce_http_status(getattr(exc, attr, None))
+        if parsed is not None:
+            return parsed
     resp = getattr(exc, "response", None)
     if resp is not None:
-        code = getattr(resp, "status_code", None)
-        if isinstance(code, int):
-            return code
+        parsed = _coerce_http_status(getattr(resp, "status_code", None))
+        if parsed is not None:
+            return parsed
+        if isinstance(resp, dict):
+            meta = resp.get("ResponseMetadata") or {}
+            parsed = _coerce_http_status(meta.get("HTTPStatusCode"))
+            if parsed is not None:
+                return parsed
     return None
 
 
@@ -331,15 +349,27 @@ def _message_indicates_http_status(msg: str, code: int) -> bool:
     return re.search(rf"\b{code}\b", msg) is not None
 
 
+def _is_explicit_rate_limit_message(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        m in msg
+        for m in ("rate limit", "rate_limit", "too many requests", "throttl", "overloaded")
+    )
+
+
 def is_retryable_llm_error(exc: BaseException, *, is_context_overflow: Callable[[BaseException], bool] | None = None) -> bool:
     """Return True if the error warrants a rate-limit / transient retry."""
     if is_context_overflow and is_context_overflow(exc):
         return False
 
+    code = _exception_status_code(exc)
+    # Some proxies return HTTP 400 with an explicit rate-limit message (not context overflow).
+    if code == 400 and _is_explicit_rate_limit_message(exc):
+        return True
+
     if _sdk_retryable(exc):
         return True
 
-    code = _exception_status_code(exc)
     if code in _NON_RETRYABLE_STATUS:
         return False
     if code in _RETRYABLE_STATUS:
@@ -480,7 +510,11 @@ def call_with_rate_limit_retry(
 
             attempt_num = attempt + 1
             ctx_str = _format_context(ctx, backend)
-            retry_hint = f"Retry-After={retry_after:.0f}s" if retry_after else "exponential backoff"
+            retry_hint = (
+                f"Retry-After={retry_after:.0f}s"
+                if retry_after and retry_after >= 1
+                else (f"Retry-After={retry_after:.2f}s" if retry_after else "exponential backoff")
+            )
             print(
                 f"[graphify] {backend or 'backend'} rate limited ({ctx_str}, "
                 f"attempt {attempt_num}/{cfg.max_retries}); waiting {int(delay)}s "

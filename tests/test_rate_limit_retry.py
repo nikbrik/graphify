@@ -151,6 +151,24 @@ def test_is_retryable_llm_error_400_not_retryable():
     assert not rate_limit.is_retryable_llm_error(exc)
 
 
+def test_is_retryable_llm_error_400_explicit_rate_limit():
+    exc = Exception("400 Bad Request: rate limit exceeded for model")
+    exc.status_code = 400
+    assert rate_limit.is_retryable_llm_error(exc)
+
+
+def test_exception_status_code_coerces_string():
+    exc = Exception("error")
+    exc.status_code = "429"
+    assert rate_limit._exception_status_code(exc) == 429
+
+
+def test_exception_status_code_from_boto_response_metadata():
+    exc = Exception("error")
+    exc.response = {"ResponseMetadata": {"HTTPStatusCode": 503}}
+    assert rate_limit._exception_status_code(exc) == 503
+
+
 def test_sleep_with_heartbeat_waits_for_extended_gate(monkeypatch):
     """Local delay may elapse while the global gate is still active — keep waiting."""
     clock = {"t": 0.0}
