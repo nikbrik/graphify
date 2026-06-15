@@ -363,6 +363,9 @@ def is_retryable_llm_error(exc: BaseException, *, is_context_overflow: Callable[
         return False
 
     code = _exception_status_code(exc)
+    if code in (401, 403, 404):
+        return False
+
     # Some proxies return HTTP 400 with an explicit rate-limit message (not context overflow).
     if code == 400 and _is_explicit_rate_limit_message(exc):
         return True

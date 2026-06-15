@@ -178,6 +178,16 @@ def test_is_retryable_llm_error_bedrock_throttling_400():
     assert rate_limit.is_retryable_llm_error(exc)
 
 
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_is_retryable_llm_error_auth_status_wins_over_bedrock_throttle_code(status):
+    exc = Exception("bedrock auth/resource error")
+    exc.response = {
+        "Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"},
+        "ResponseMetadata": {"HTTPStatusCode": status},
+    }
+    assert not rate_limit.is_retryable_llm_error(exc)
+
+
 def test_sleep_with_heartbeat_waits_for_extended_gate(monkeypatch):
     """Local delay may elapse while the global gate is still active — keep waiting."""
     clock = {"t": 0.0}
