@@ -17,6 +17,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from graphify.rate_limit import (
+    RateLimitContext,
+    SubprocessRateLimitError,
+    call_with_rate_limit_retry,
+    is_subprocess_rate_limit_error,
+    reset_global_rate_limit_stats,
+    set_rate_limit_context,
+    snapshot_global_rate_limit_stats,
+)
+
 # `_read_files` truncates each file at this many characters before joining into
 # the user message. Token estimates use the same cap so packing matches reality.
 _FILE_CHAR_CAP = 20_000
@@ -645,8 +655,15 @@ def _looks_like_response_format_unsupported(exc: BaseException) -> bool:
 
 def _create_chat_completion_with_format_fallback(client, kwargs: dict, backend: str):
     """Create a chat completion, retrying once without response_format if rejected."""
+    def _create():
+        return client.chat.completions.create(**kwargs)
+
     try:
-        return client.chat.completions.create(**kwargs), bool(kwargs.get("response_format"))
+        return call_with_rate_limit_retry(
+            _create,
+            backend=backend,
+            is_context_overflow=_looks_like_context_exceeded,
+        ), bool(kwargs.get("response_format"))
     except Exception as exc:
         if "response_format" not in kwargs or not _looks_like_response_format_unsupported(exc):
             raise
@@ -657,7 +674,15 @@ def _create_chat_completion_with_format_fallback(client, kwargs: dict, backend: 
             f"({type(exc).__name__}: {str(exc)[:200]}); retrying without it.",
             file=sys.stderr,
         )
-        return client.chat.completions.create(**fallback), False
+
+        def _create_fallback():
+            return client.chat.completions.create(**fallback)
+
+        return call_with_rate_limit_retry(
+            _create_fallback,
+            backend=backend,
+            is_context_overflow=_looks_like_context_exceeded,
+        ), False
 
 
 def _file_to_text(path: Path) -> str:
@@ -1215,7 +1240,11 @@ def _repair_openai_compat_json(
     if response_format is not None:
         kwargs["response_format"] = response_format
     try:
-        resp, _ = _create_chat_completion_with_format_fallback(client, kwargs, backend)
+        resp, _ = call_with_rate_limit_retry(
+            lambda: _create_chat_completion_with_format_fallback(client, kwargs, backend),
+            backend=backend,
+            is_context_overflow=_looks_like_context_exceeded,
+        )
     except Exception as exc:  # noqa: BLE001 - repair is best-effort
         return _LLMJsonParseResult(_empty_fragment(), False, str(exc)), 0, 0
     raw = resp.choices[0].message.content if resp.choices and resp.choices[0].message else ""
@@ -1421,11 +1450,15 @@ def _call_claude(api_key: str, model: str, user_message: str, max_tokens: int = 
         raise ImportError(_backend_pkg_hint("anthropic", "anthropic")) from exc
 
     client = anthropic.Anthropic(api_key=api_key, timeout=_resolve_api_timeout())
-    resp = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=_extraction_system(deep=deep_mode),
-        messages=[{"role": "user", "content": _anthropic_content(user_message, images or [])}],
+    resp = call_with_rate_limit_retry(
+        lambda: client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=_extraction_system(deep=deep_mode),
+            messages=[{"role": "user", "content": _anthropic_content(user_message, images or [])}],
+        ),
+        backend="claude",
+        is_context_overflow=_looks_like_context_exceeded,
     )
     raw_content = resp.content[0].text if resp.content else None
     result = _parse_llm_json(raw_content or "{}")
@@ -1565,20 +1598,29 @@ def _call_claude_cli(
     cli_model = _resolve_claude_cli_model(model)
     if cli_model:
         cli_args.extend(["--model", cli_model])
-    proc = subprocess.run(
-        cli_args,
-        input=user_message,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",  # Force UTF-8 — prevents UnicodeEncodeError on Windows cp1252
-        timeout=_resolve_api_timeout(),
-        check=False,
-        **_no_window_kwargs(),
-    )
-    if proc.returncode != 0:
+
+    def _run_cli():
+        proc = subprocess.run(
+            cli_args,
+            input=user_message,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",  # Force UTF-8 — prevents UnicodeEncodeError on Windows cp1252
+            timeout=_resolve_api_timeout(),
+            check=False,
+            **_no_window_kwargs(),
+        )
+        if proc.returncode == 0:
+            return proc
+        if is_subprocess_rate_limit_error(proc.stderr, proc.returncode):
+            raise SubprocessRateLimitError(
+                f"claude -p rate limited: {proc.stderr.strip()[:500]}"
+            )
         raise RuntimeError(
             f"claude -p exited {proc.returncode}: {proc.stderr.strip()[:500]}"
         )
+
+    proc = call_with_rate_limit_retry(_run_cli, backend="claude-cli")
 
     envelope = _claude_cli_envelope(proc.stdout)
 
@@ -1724,19 +1766,27 @@ def _call_codex_cli_text(
         cli_args.extend(["-m", cli_model])
     cli_args.append(prompt)
     try:
-        proc = subprocess.run(
-            cli_args,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=_resolve_api_timeout(),
-            check=False,
-            **_no_window_kwargs(),
-        )
-        if proc.returncode != 0:
+        def _run_codex():
+            proc = subprocess.run(
+                cli_args,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=_resolve_api_timeout(),
+                check=False,
+                **_no_window_kwargs(),
+            )
+            if proc.returncode == 0:
+                return proc
+            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode):
+                raise SubprocessRateLimitError(
+                    f"codex exec rate limited: {proc.stderr.strip()[:500]}"
+                )
             raise RuntimeError(
                 f"codex exec exited {proc.returncode}: {proc.stderr.strip()[:500]}"
             )
+
+        proc = call_with_rate_limit_retry(_run_codex, backend="codex-cli")
         if output_path.is_file() and output_path.stat().st_size > 0:
             return output_path.read_text(encoding="utf-8")
         return proc.stdout.strip()
@@ -1797,20 +1847,28 @@ def _call_codex_cli(
     cli_args.append(system_prompt)
 
     try:
-        proc = subprocess.run(
-            cli_args,
-            input=user_message,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=_resolve_api_timeout(),
-            check=False,
-            **_no_window_kwargs(),
-        )
-        if proc.returncode != 0:
+        def _run_codex():
+            proc = subprocess.run(
+                cli_args,
+                input=user_message,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=_resolve_api_timeout(),
+                check=False,
+                **_no_window_kwargs(),
+            )
+            if proc.returncode == 0:
+                return proc
+            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode):
+                raise SubprocessRateLimitError(
+                    f"codex exec rate limited: {proc.stderr.strip()[:500]}"
+                )
             raise RuntimeError(
                 f"codex exec exited {proc.returncode}: {proc.stderr.strip()[:500]}"
             )
+
+        proc = call_with_rate_limit_retry(_run_codex, backend="codex-cli")
 
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise RuntimeError(
@@ -1896,7 +1954,11 @@ def _call_azure(
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
-    resp = client.chat.completions.create(**kwargs)
+    resp = call_with_rate_limit_retry(
+        lambda: client.chat.completions.create(**kwargs),
+        backend="azure",
+        is_context_overflow=_looks_like_context_exceeded,
+    )
     if not resp.choices or resp.choices[0].message is None:
         raise ValueError("Azure OpenAI returned empty or filtered response")
     raw_content = resp.choices[0].message.content
@@ -1931,11 +1993,15 @@ def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192, *, deep
     client = session.client("bedrock-runtime")
 
     try:
-        resp = client.converse(
-            modelId=model,
-            system=[{"text": _extraction_system(deep=deep_mode)}],
-            messages=[{"role": "user", "content": _bedrock_content(user_message, images or [])}],
-            inferenceConfig=_bedrock_inference_config(max_tokens, model),
+        resp = call_with_rate_limit_retry(
+            lambda: client.converse(
+                modelId=model,
+                system=[{"text": _extraction_system(deep=deep_mode)}],
+                messages=[{"role": "user", "content": _bedrock_content(user_message, images or [])}],
+                inferenceConfig=_bedrock_inference_config(max_tokens, model),
+            ),
+            backend="bedrock",
+            is_context_overflow=_looks_like_context_exceeded,
         )
     except botocore.exceptions.ClientError as exc:
         code = exc.response["Error"]["Code"]
@@ -2427,12 +2493,21 @@ def extract_corpus_parallel(
     merged: dict = {
         "nodes": [], "edges": [], "hyperedges": [],
         "input_tokens": 0, "output_tokens": 0,
-        "failed_chunks": 0,  # count of chunks that raised — loud failure on chunk errors
+        "failed_chunks": 0,
+        "rate_limit_retries": 0,
+        "rate_limit_wait_seconds": 0.0,
+        "rate_limit_recovered_chunks": 0,
     }
     total = len(chunks)
+    reset_global_rate_limit_stats()
+    recovered_chunks = 0
 
     def _run_one(idx: int, chunk: list[Path]) -> tuple[int, dict | None, Exception | None]:
         t0 = time.time()
+        before = snapshot_global_rate_limit_stats()
+        prev_ctx = set_rate_limit_context(
+            RateLimitContext(chunk_idx=idx, chunk_total=total, backend=backend)
+        )
         try:
             result = _extract_with_adaptive_retry(
                 chunk,
@@ -2444,9 +2519,16 @@ def extract_corpus_parallel(
                 deep_mode=deep_mode,
             )
             result["elapsed_seconds"] = round(time.time() - t0, 2)
+            after = snapshot_global_rate_limit_stats()
+            chunk_retries = int(after["retries"]) - int(before["retries"])
+            if chunk_retries > 0:
+                nonlocal recovered_chunks
+                recovered_chunks += 1
             return idx, result, None
         except Exception as exc:  # noqa: BLE001 — caller-facing surface, log + continue
             return idx, None, exc
+        finally:
+            set_rate_limit_context(prev_ctx)
 
     # Ollama serves one request at a time per loaded model on a single GPU.
     # Four concurrent 60k-token requests cause VRAM pressure and hollow
@@ -2495,6 +2577,19 @@ def extract_corpus_parallel(
     # Loud failure summary — surface chunk failures at end so they're never
     # buried mid-log. Exit 0 preserved for caller compatibility; the
     # summary block makes the problem visible.
+    final_stats = snapshot_global_rate_limit_stats()
+    merged["rate_limit_retries"] = int(final_stats["retries"])
+    merged["rate_limit_wait_seconds"] = round(float(final_stats["wait_seconds"]), 2)
+    merged["rate_limit_recovered_chunks"] = recovered_chunks
+    if merged["rate_limit_retries"] > 0:
+        dropped = merged["failed_chunks"]
+        print(
+            f"[graphify] rate limit: {recovered_chunks} chunk(s) recovered after "
+            f"{merged['rate_limit_retries']} retries "
+            f"({merged['rate_limit_wait_seconds']:.0f}s waited)"
+            + (f"; {dropped} chunk(s) dropped" if dropped else ""),
+            file=sys.stderr,
+        )
     if merged["failed_chunks"] > 0:
         print(
             f"[graphify] WARNING: {merged['failed_chunks']}/{total} semantic chunk(s) failed"
@@ -2551,11 +2646,15 @@ def _call_llm(
             import anthropic
         except ImportError as exc:
             raise ImportError(_backend_pkg_hint("anthropic", "anthropic")) from exc
-        client = anthropic.Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=mdl,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+        client = anthropic.Anthropic(api_key=key, timeout=_resolve_api_timeout())
+        resp = call_with_rate_limit_retry(
+            lambda: client.messages.create(
+                model=mdl,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            ),
+            backend="claude",
+            is_context_overflow=_looks_like_context_exceeded,
         )
         return resp.content[0].text if resp.content else ""
 
@@ -2567,18 +2666,27 @@ def _call_llm(
         cli_model = _resolve_claude_cli_model(mdl)
         if cli_model:
             cli_args.extend(["--model", cli_model])
-        proc = subprocess.run(
-            cli_args,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",  # Force UTF-8 — prevents UnicodeEncodeError on Windows cp1252
-            timeout=_resolve_api_timeout(),
-            check=False,
-            **_no_window_kwargs(),
-        )
-        if proc.returncode != 0:
+
+        def _run_claude_cli():
+            proc = subprocess.run(
+                cli_args,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=_resolve_api_timeout(),
+                check=False,
+                **_no_window_kwargs(),
+            )
+            if proc.returncode == 0:
+                return proc
+            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode):
+                raise SubprocessRateLimitError(
+                    f"claude -p rate limited: {proc.stderr.strip()[:500]}"
+                )
             raise RuntimeError(f"claude -p exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+
+        proc = call_with_rate_limit_retry(_run_claude_cli, backend="claude-cli")
         envelope = _claude_cli_envelope(proc.stdout)
         return envelope.get("result", "")
 
@@ -2595,10 +2703,14 @@ def _call_llm(
         profile = os.environ.get("AWS_PROFILE")
         session = boto3.Session(profile_name=profile, region_name=region)
         client = session.client("bedrock-runtime")
-        resp = client.converse(
-            modelId=mdl,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig=_bedrock_inference_config(max_tokens, mdl),
+        resp = call_with_rate_limit_retry(
+            lambda: client.converse(
+                modelId=mdl,
+                messages=[{"role": "user", "content": [{"text": prompt}]}],
+                inferenceConfig=_bedrock_inference_config(max_tokens, mdl),
+            ),
+            backend="bedrock",
+            is_context_overflow=_looks_like_context_exceeded,
         )
         return resp.get("output", {}).get("message", {}).get("content", [{}])[0].get("text", "")
 
@@ -2631,7 +2743,7 @@ def _call_llm(
         from openai import OpenAI
     except ImportError as exc:
         raise ImportError(_backend_pkg_hint("openai", "openai")) from exc
-    client = OpenAI(api_key=key, base_url=cfg["base_url"])
+    client = OpenAI(api_key=key, base_url=cfg["base_url"], timeout=_resolve_api_timeout())
     kwargs: dict = {
         "model": mdl,
         "messages": [{"role": "user", "content": prompt}],

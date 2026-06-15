@@ -414,6 +414,12 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 | `GRAPHIFY_MAX_WORKERS` | AST parallelism thread count | optional — also `--max-workers` flag |
 | `GRAPHIFY_MAX_OUTPUT_TOKENS` | Raise output cap for dense corpora | optional — e.g. `32768` for large files |
 | `GRAPHIFY_API_TIMEOUT` | Per-call timeout in seconds for HTTP, claude-cli, codex-cli, and Anthropic SDK backends (default: 600) | optional — also `--api-timeout` flag |
+| `GRAPHIFY_RATE_LIMIT_RETRY` | Enable automatic retry on HTTP 429/503 (default: enabled). Set to `0` to disable | optional — also `--no-rate-limit-retry` |
+| `GRAPHIFY_RATE_LIMIT_MAX_WAIT` | Max seconds to sleep per rate-limit retry (default: 600) | optional — also `--rate-limit-max-wait` |
+| `GRAPHIFY_RATE_LIMIT_MAX_TOTAL_WAIT` | Max total wait per API call across all retries (default: 3600) | optional — also `--rate-limit-max-total-wait` |
+| `GRAPHIFY_RATE_LIMIT_MAX_RETRIES` | Max retry attempts per API call (default: 25) | optional — also `--rate-limit-retries` |
+| `GRAPHIFY_RATE_LIMIT_BACKOFF_BASE` | Exponential backoff base in seconds (default: 2) | optional |
+| `GRAPHIFY_RATE_LIMIT_BACKOFF_MULTIPLIER` | Exponential backoff multiplier (default: 2) | optional |
 | `GRAPHIFY_CODEX_CLI_MODEL` | Model override for `codex exec -m` when using `--backend codex-cli` | optional — defaults to Codex user config |
 | `GRAPHIFY_CODEX_CLI_PARALLEL` | Set to `1` to allow parallel semantic chunks via codex-cli (default: serial) | optional |
 | `GRAPHIFY_CODEX_CLI_SANDBOX` | Sandbox mode for codex-cli: `read-only` (default) or `bypass` | optional |
@@ -659,8 +665,11 @@ For cheaper or smaller models (e.g. `deepseek/deepseek-v4-flash`) on doc-heavy c
 # Recommended for deepseek-v4-flash on large doc trees
 export GRAPHIFY_MAX_OUTPUT_TOKENS=16384
 graphify extract . --backend openrouter --model deepseek/deepseek-v4-flash \
-  --token-budget 6000 --max-files-per-chunk 6 --max-concurrency 2
+  --token-budget 6000 --max-files-per-chunk 6 --max-concurrency 2 \
+  --rate-limit-max-wait 600 --rate-limit-max-total-wait 3600
 ```
+
+On HTTP 429 (rate limit), graphify waits and retries automatically — respecting `Retry-After` when the provider sends it. Use `--max-concurrency 2` with rate-limit retry for doc-heavy corpora on OpenRouter/DeepSeek.
 
 `GRAPHIFY_MAX_OUTPUT_TOKENS` raises the per-request output cap (default follows the backend, typically 16384). `--token-budget` limits input tokens per chunk; `--max-files-per-chunk` overrides the default file cap (8 docs / 20 code).
 

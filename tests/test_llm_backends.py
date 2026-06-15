@@ -987,3 +987,128 @@ def test_openai_compat_env_var_temperature_applied(tmp_path, monkeypatch):
     llm.extract_files_direct([tmp_path / "f.py"], backend="openai", root=tmp_path)
 
     assert captured.get("temperature") == 0.3
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit retry integration
+# ---------------------------------------------------------------------------
+
+
+def test_call_openai_compat_retries_on_rate_limit(monkeypatch):
+    import sys
+    import types
+
+    from graphify import rate_limit
+
+    calls = {"n": 0}
+    ok = _fake_openai_response(
+        '{"nodes":[],"edges":[],"hyperedges":[]}',
+        completion_tokens=10,
+    )
+
+    class RateLimitError(Exception):
+        status_code = 429
+
+        def __init__(self):
+            super().__init__("Error code: 429 - rate limit")
+            self.response = type(
+                "Resp",
+                (),
+                {"headers": {"retry-after": "0.01"}, "status_code": 429},
+            )()
+
+    class _FakeOpenAI:
+        def __init__(self, *_, **__):
+            self.chat = self
+            self.completions = self
+
+        def create(self, **__):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RateLimitError()
+            return ok
+
+    fake_module = types.ModuleType("openai")
+    fake_module.OpenAI = _FakeOpenAI
+    fake_module.RateLimitError = RateLimitError
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+    cfg = rate_limit.RateLimitConfig(
+        max_wait_per_attempt=1.0,
+        max_total_wait=10.0,
+        max_retries=5,
+        backoff_base=0.01,
+    )
+    monkeypatch.setattr(rate_limit, "resolve_rate_limit_config", lambda: cfg)
+    monkeypatch.setattr(rate_limit.time, "sleep", lambda _: None)
+
+    result = llm._call_openai_compat(
+        "https://openrouter.ai/api/v1",
+        "sk-test",
+        "deepseek/deepseek-v4-flash",
+        "user msg",
+        temperature=0,
+        max_completion_tokens=8192,
+        backend="openrouter",
+    )
+    assert calls["n"] == 3
+    assert result["nodes"] == []
+
+
+def test_extract_corpus_parallel_recovers_from_rate_limit(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from graphify import rate_limit
+
+    f = tmp_path / "note.md"
+    f.write_text("# Doc\nSome content.\n")
+    calls = {"n": 0}
+    ok_resp = _fake_openai_response(
+        '{"nodes":[{"id":"note_x","label":"X"}],"edges":[],"hyperedges":[]}',
+        completion_tokens=10,
+    )
+
+    class RateLimitError(Exception):
+        status_code = 429
+
+        def __init__(self):
+            super().__init__("Error code: 429 - rate limit exceeded")
+            self.response = type(
+                "Resp",
+                (),
+                {"headers": {"retry-after": "0.01"}, "status_code": 429},
+            )()
+
+    class _FakeOpenAI:
+        def __init__(self, *_, **__):
+            self.chat = self
+            self.completions = self
+
+        def create(self, **__):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise RateLimitError()
+            return ok_resp
+
+    fake_module = types.ModuleType("openai")
+    fake_module.OpenAI = _FakeOpenAI
+    fake_module.RateLimitError = RateLimitError
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "test-key")
+
+    cfg = rate_limit.RateLimitConfig(
+        max_wait_per_attempt=1.0,
+        max_total_wait=10.0,
+        max_retries=5,
+        backoff_base=0.01,
+    )
+    monkeypatch.setattr(rate_limit, "resolve_rate_limit_config", lambda: cfg)
+    monkeypatch.setattr(rate_limit.time, "sleep", lambda _: None)
+
+    result = llm.extract_corpus_parallel([f], backend="kimi", root=tmp_path, max_concurrency=1)
+    assert result["failed_chunks"] == 0
+    assert len(result["nodes"]) == 1
+    assert result["rate_limit_retries"] >= 1
+    assert result["rate_limit_recovered_chunks"] >= 1
+

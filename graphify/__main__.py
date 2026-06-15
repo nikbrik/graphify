@@ -2189,6 +2189,10 @@ def main() -> None:
         print("    --max-concurrency N     parallel semantic chunks in flight (default: 4; set 1 for local LLMs)")
         print("    --max-files-per-chunk N cap files per semantic chunk (default: 8 docs, 20 code)")
         print("    --api-timeout S         per-request timeout in seconds for the LLM client (default: 600)")
+        print("    --rate-limit-max-wait S max seconds to wait per rate-limit retry (default: 600)")
+        print("    --rate-limit-max-total-wait S max total wait per API call across retries (default: 3600)")
+        print("    --rate-limit-retries N  max rate-limit retry attempts per API call (default: 25)")
+        print("    --no-rate-limit-retry   disable automatic retry on HTTP 429/503")
         print("    --out DIR               output dir (default: <path>); writes <DIR>/graphify-out/")
         print("    --google-workspace      export .gdoc/.gsheet/.gslides shortcuts via gws before extraction")
         print("    --no-cluster            skip clustering, write raw extraction only")
@@ -4010,7 +4014,8 @@ def main() -> None:
                 "[--model M] [--mode deep] [--out DIR] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--max-files-per-chunk N] "
-                "[--api-timeout S] [--postgres DSN] [--cargo]",
+                "[--api-timeout S] [--rate-limit-max-wait S] [--rate-limit-max-total-wait S] "
+                "[--rate-limit-retries N] [--no-rate-limit-retry] [--postgres DSN] [--cargo]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -4042,6 +4047,10 @@ def main() -> None:
         cli_max_concurrency: int | None = None
         cli_max_files_per_chunk: int | None = None
         cli_api_timeout: float | None = None
+        cli_rate_limit_max_wait: float | None = None
+        cli_rate_limit_max_total_wait: float | None = None
+        cli_rate_limit_retries: int | None = None
+        cli_no_rate_limit_retry: bool = False
         # Clustering tuning knobs
         cli_resolution: float = 1.0
         cli_exclude_hubs: float | None = None
@@ -4119,6 +4128,20 @@ def main() -> None:
                 cli_api_timeout = _parse_float("--api-timeout", args[i + 1]); i += 2
             elif a.startswith("--api-timeout="):
                 cli_api_timeout = _parse_float("--api-timeout", a.split("=", 1)[1]); i += 1
+            elif a == "--rate-limit-max-wait" and i + 1 < len(args):
+                cli_rate_limit_max_wait = _parse_float("--rate-limit-max-wait", args[i + 1]); i += 2
+            elif a.startswith("--rate-limit-max-wait="):
+                cli_rate_limit_max_wait = _parse_float("--rate-limit-max-wait", a.split("=", 1)[1]); i += 1
+            elif a == "--rate-limit-max-total-wait" and i + 1 < len(args):
+                cli_rate_limit_max_total_wait = _parse_float("--rate-limit-max-total-wait", args[i + 1]); i += 2
+            elif a.startswith("--rate-limit-max-total-wait="):
+                cli_rate_limit_max_total_wait = _parse_float("--rate-limit-max-total-wait", a.split("=", 1)[1]); i += 1
+            elif a == "--rate-limit-retries" and i + 1 < len(args):
+                cli_rate_limit_retries = _parse_int("--rate-limit-retries", args[i + 1]); i += 2
+            elif a.startswith("--rate-limit-retries="):
+                cli_rate_limit_retries = _parse_int("--rate-limit-retries", a.split("=", 1)[1]); i += 1
+            elif a == "--no-rate-limit-retry":
+                cli_no_rate_limit_retry = True; i += 1
             elif a == "--resolution" and i + 1 < len(args):
                 cli_resolution = _parse_float("--resolution", args[i + 1]); i += 2
             elif a.startswith("--resolution="):
@@ -4161,6 +4184,14 @@ def main() -> None:
         # _call_openai_compat picks it up without needing a new kwarg path.
         if cli_api_timeout is not None:
             os.environ["GRAPHIFY_API_TIMEOUT"] = str(cli_api_timeout)
+        if cli_rate_limit_max_wait is not None:
+            os.environ["GRAPHIFY_RATE_LIMIT_MAX_WAIT"] = str(cli_rate_limit_max_wait)
+        if cli_rate_limit_max_total_wait is not None:
+            os.environ["GRAPHIFY_RATE_LIMIT_MAX_TOTAL_WAIT"] = str(cli_rate_limit_max_total_wait)
+        if cli_rate_limit_retries is not None:
+            os.environ["GRAPHIFY_RATE_LIMIT_MAX_RETRIES"] = str(cli_rate_limit_retries)
+        if cli_no_rate_limit_retry:
+            os.environ["GRAPHIFY_RATE_LIMIT_RETRY"] = "0"
         if cli_max_workers is not None:
             os.environ["GRAPHIFY_MAX_WORKERS"] = str(cli_max_workers)
 
