@@ -1240,11 +1240,7 @@ def _repair_openai_compat_json(
     if response_format is not None:
         kwargs["response_format"] = response_format
     try:
-        resp, _ = call_with_rate_limit_retry(
-            lambda: _create_chat_completion_with_format_fallback(client, kwargs, backend),
-            backend=backend,
-            is_context_overflow=_looks_like_context_exceeded,
-        )
+        resp, _ = _create_chat_completion_with_format_fallback(client, kwargs, backend)
     except Exception as exc:  # noqa: BLE001 - repair is best-effort
         return _LLMJsonParseResult(_empty_fragment(), False, str(exc)), 0, 0
     raw = resp.choices[0].message.content if resp.choices and resp.choices[0].message else ""
@@ -1612,7 +1608,7 @@ def _call_claude_cli(
         )
         if proc.returncode == 0:
             return proc
-        if is_subprocess_rate_limit_error(proc.stderr, proc.returncode):
+        if is_subprocess_rate_limit_error(proc.stderr, proc.returncode, proc.stdout):
             raise SubprocessRateLimitError(
                 f"claude -p rate limited: {proc.stderr.strip()[:500]}"
             )
@@ -1778,7 +1774,7 @@ def _call_codex_cli_text(
             )
             if proc.returncode == 0:
                 return proc
-            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode):
+            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode, proc.stdout):
                 raise SubprocessRateLimitError(
                     f"codex exec rate limited: {proc.stderr.strip()[:500]}"
                 )
@@ -1860,7 +1856,7 @@ def _call_codex_cli(
             )
             if proc.returncode == 0:
                 return proc
-            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode):
+            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode, proc.stdout):
                 raise SubprocessRateLimitError(
                     f"codex exec rate limited: {proc.stderr.strip()[:500]}"
                 )
@@ -2502,12 +2498,13 @@ def extract_corpus_parallel(
     reset_global_rate_limit_stats()
     recovered_chunks = 0
 
-    def _run_one(idx: int, chunk: list[Path]) -> tuple[int, dict | None, Exception | None]:
+    def _run_one(idx: int, chunk: list[Path]) -> tuple[int, dict | None, Exception | None, int]:
         t0 = time.time()
         before = snapshot_global_rate_limit_stats()
         prev_ctx = set_rate_limit_context(
             RateLimitContext(chunk_idx=idx, chunk_total=total, backend=backend)
         )
+        chunk_retries = 0
         try:
             result = _extract_with_adaptive_retry(
                 chunk,
@@ -2521,12 +2518,9 @@ def extract_corpus_parallel(
             result["elapsed_seconds"] = round(time.time() - t0, 2)
             after = snapshot_global_rate_limit_stats()
             chunk_retries = int(after["retries"]) - int(before["retries"])
-            if chunk_retries > 0:
-                nonlocal recovered_chunks
-                recovered_chunks += 1
-            return idx, result, None
+            return idx, result, None, chunk_retries
         except Exception as exc:  # noqa: BLE001 — caller-facing surface, log + continue
-            return idx, None, exc
+            return idx, None, exc, 0
         finally:
             set_rate_limit_context(prev_ctx)
 
@@ -2548,12 +2542,14 @@ def extract_corpus_parallel(
         # Avoid thread pool overhead for single-worker runs (and keep
         # callback ordering identical to the pre-refactor sequential path).
         for idx, chunk in enumerate(chunks):
-            _, result, exc = _run_one(idx, chunk)
+            _, result, exc, chunk_retries = _run_one(idx, chunk)
             if exc is not None:
                 print(f"[graphify] chunk {idx + 1}/{total} failed: {exc}", file=sys.stderr)
                 merged["failed_chunks"] += 1
                 continue
             assert result is not None
+            if chunk_retries > 0:
+                recovered_chunks += 1
             _merge_into(merged, result)
             if callable(on_chunk_done):
                 on_chunk_done(idx, total, result)
@@ -2561,7 +2557,7 @@ def extract_corpus_parallel(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(_run_one, idx, chunk) for idx, chunk in enumerate(chunks)]
             for future in as_completed(futures):
-                idx, result, exc = future.result()
+                idx, result, exc, chunk_retries = future.result()
                 if exc is not None:
                     print(
                         f"[graphify] chunk {idx + 1}/{total} failed: {exc}",
@@ -2570,6 +2566,8 @@ def extract_corpus_parallel(
                     merged["failed_chunks"] += 1
                     continue
                 assert result is not None
+                if chunk_retries > 0:
+                    recovered_chunks += 1
                 _merge_into(merged, result)
                 if callable(on_chunk_done):
                     on_chunk_done(idx, total, result)
@@ -2680,7 +2678,7 @@ def _call_llm(
             )
             if proc.returncode == 0:
                 return proc
-            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode):
+            if is_subprocess_rate_limit_error(proc.stderr, proc.returncode, proc.stdout):
                 raise SubprocessRateLimitError(
                     f"claude -p rate limited: {proc.stderr.strip()[:500]}"
                 )

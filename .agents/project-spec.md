@@ -24,6 +24,7 @@ detect() -> extract() -> build_graph() -> cluster() -> analyze() -> report() -> 
 Important subsystems:
 - Corpus discovery and ignore handling: `graphify/detect.py`, `graphify/manifest.py`
 - AST and semantic extraction: `graphify/extract.py`, `graphify/llm.py`
+- LLM HTTP rate-limit retry policy: `graphify/rate_limit.py` (429/503; used by `llm.py`)
 - Graph construction, clustering, analysis, and reporting: `graphify/build.py`, `graphify/cluster.py`, `graphify/analyze.py`, `graphify/report.py`
 - Querying and serving graph data: `graphify/serve.py`, `graphify/global_graph.py`, `graphify/querylog.py`
 - Exports and generated views: `graphify/export.py`, `graphify/wiki.py`, `graphify/callflow_html.py`, `graphify/tree_html.py`
@@ -149,6 +150,124 @@ When changing install or host integration behavior:
 Semantic extraction go through `graphify/llm.py`. AST/code path no LLM. Headless
 `graphify extract` pick backend via `--backend` or `detect_backend()` API-key
 priority.
+
+### HTTP rate-limit retry (429)
+
+RPM/TPM → 429/503. Extract wait+retry, no drop chunk. Policy: **`graphify/rate_limit.py`**. Wire: **`graphify/llm.py`**. Docs: **`README.md`** env + OpenRouter. Tests: **`tests/test_rate_limit_retry.py`**, **`tests/test_llm_backends.py`**.
+
+#### Two retry layers — never merge
+
+| Layer | Module / fn | Trigger | Action |
+|-------|-------------|---------|--------|
+| **Adaptive bisection** | `_extract_with_adaptive_retry()` | `finish_reason=length`, context overflow, hollow 200 | Split chunk, recurse (`max_retry_depth`) |
+| **HTTP rate-limit** | `call_with_rate_limit_retry()` | 429/503/502/504, `RateLimitError`, throttle, timeout | Sleep Retry-After/backoff, retry same HTTP req |
+
+**Must:** 429 retry below adaptive, inside `_call_*` / SDK wrapper.
+**Must not:** 429 in `_extract_with_adaptive_retry` — `test_adaptive_retry_re_raises_unrelated_errors` guard.
+**Must not:** Double-wrap — `_create_chat_completion_with_format_fallback` already wraps; `_repair_openai_compat_json` call direct, no outer wrapper.
+
+Call stack (OpenRouter extract):
+
+```text
+extract_corpus_parallel
+  → _run_one [thread-local RateLimitContext chunk idx/total]
+  → _extract_with_adaptive_retry          # truncation only
+      → extract_files_direct
+          → _call_openai_compat
+              → _create_chat_completion_with_format_fallback
+                  → call_with_rate_limit_retry → client.chat.completions.create
+              → _repair_openai_compat_json (optional, same inner path)
+```
+
+Also: `_call_claude`, `_call_azure`, `_call_bedrock` wrap SDK; `claude-cli`/`codex-cli` subprocess — 429 in stderr **or** stdout → `SubprocessRateLimitError` → retry. `label`/`dedup`/`prs` via `_call_llm()` same retry; OpenAI-compat `_call_llm` need `timeout=_resolve_api_timeout()`.
+
+#### Touch map
+
+| What | Where |
+|------|-------|
+| Policy, gate, backoff, Retry-After | `graphify/rate_limit.py` |
+| OpenAI-compat, format fallback, repair | `llm.py` `_create_chat_completion_with_format_fallback`, `_repair_openai_compat_json` |
+| API backends | `llm.py` `_call_claude`, `_call_azure`, `_call_bedrock` |
+| Subscription CLI | `llm.py` `_call_claude_cli`, `_call_codex_cli`, `_call_codex_cli_text`, `_call_llm` claude branch |
+| Parallel extract + metrics | `llm.py` `extract_corpus_parallel` — stats reset, `set_rate_limit_context`, keys `rate_limit_*` |
+| CLI → env | `graphify/__main__.py` extract ~4040 — `--rate-limit-*`, `--no-rate-limit-retry` |
+| Unit / integration / regression | `tests/test_rate_limit_retry.py`, `tests/test_llm_backends.py`, `tests/test_chunking.py`, `tests/test_extract_cli.py`, `tests/test_charmap_encoding.py` |
+
+OpenRouter/DeepSeek/Kimi/custom `providers.json` → `_call_openai_compat` — one path. No OpenRouter-only fork unless generic Retry-After + body `retry_after` fail.
+
+#### Parallel (`--max-concurrency > 1`)
+
+- **`_RateLimitGate`**: worker 429 → `signal_pause(delay)`; all `wait_if_paused()` before retry.
+- **`_sleep_with_heartbeat`**: wait `max(local_deadline, gate_remaining)` — no early exit if peer extended gate.
+- **`total_waited` / stats**: actual elapsed sleep, not planned `delay` — else `MAX_TOTAL_WAIT` wrong under gate extend.
+- **`rate_limit_recovered_chunks`**: main thread after `future.result()` — not `nonlocal` in worker (race).
+- Ollama/claude-cli/codex-cli serial default — gate still OK.
+
+#### Retry policy
+
+| Signal | Retry? |
+|--------|--------|
+| 429, 503, 502, 504, `RateLimitError`, Bedrock throttle | yes |
+| `APITimeoutError`, timeout name/msg | yes |
+| 400 incl context overflow | **no** → adaptive |
+| 401, 403, 404 | no |
+| `"502" in msg` | **no** — `\b502\b` only (not `5020`) |
+| `x-ratelimit-reset-requests` header | **not** Retry-After seconds |
+
+Backoff: header/body `retry_after`/`retryAfter` (cap per attempt); else exp+jitter. `_sdk_retryable()` isinstance before substring.
+
+#### Config
+
+| Var / flag | Default | Notes |
+|------------|---------|-------|
+| `GRAPHIFY_RATE_LIMIT_RETRY` | on | `0` / `--no-rate-limit-retry` off |
+| `GRAPHIFY_RATE_LIMIT_MAX_WAIT` | 600 | one pause max; `--rate-limit-max-wait` |
+| `GRAPHIFY_RATE_LIMIT_MAX_TOTAL_WAIT` | 3600 | per `call_with_rate_limit_retry` chain; `--rate-limit-max-total-wait` |
+| `GRAPHIFY_RATE_LIMIT_MAX_RETRIES` | 25 | `--rate-limit-retries` |
+| `GRAPHIFY_RATE_LIMIT_BACKOFF_BASE` | 2 | sec |
+| `GRAPHIFY_RATE_LIMIT_BACKOFF_MULTIPLIER` | 2 | |
+| `GRAPHIFY_API_TIMEOUT` | 600 | single HTTP attempt only — not inter-retry sleep |
+
+OpenRouter doc-heavy: `--max-concurrency 2 --rate-limit-max-wait 600 --rate-limit-max-total-wait 3600`
+
+#### UX / exit
+
+- Stderr: `[graphify] {backend} rate limited (chunk i/n, attempt a/m); waiting Xs (Retry-After=…)`
+- Heartbeat 60s if wait >120s
+- Summary: `rate limit: N recovered, M retries, Ts waited; K dropped`
+- `on_chunk_done`: success only
+- Exit 1: all uncached chunks fail (`_chunk_stats["succeeded"]==0`)
+- Partial drop: exit 0 + `failed_chunks` WARNING
+
+#### Tests (rate-limit PR)
+
+- [ ] `test_rate_limit_retry.py` — Retry-After, 400 no-retry, gate extend, actual wait budget, stdout 429
+- [ ] `test_llm_backends.py` — 429→200, `extract_corpus_parallel` metrics
+- [ ] Adaptive: `test_adaptive_retry_*`, `test_looks_like_context_exceeded_ignores_unrelated_errors`
+- [ ] Mock `time.sleep` — no real long waits in CI
+
+#### Common mistakes (429 post-mortem)
+
+1. 429 in `_extract_with_adaptive_retry` — wrong layer
+2. Double wrap repair around `_create_chat_completion_with_format_fallback` — 2× budget/stats
+3. `recovered_chunks += 1` in pool worker — race
+4. `x-ratelimit-reset-requests` as seconds — wrong (e.g. `6m0s`)
+5. `"502" in str(exc)` — hits `5020`; word boundary
+6. HTTP 400 + `"capacity"` msg → HTTP retry — 400 in `_NON_RETRYABLE_STATUS`
+7. `_sleep_with_heartbeat` exit before gate clear — herd
+8. `total_waited += delay` not actual — busts `MAX_TOTAL_WAIT`
+9. Subprocess 429 stderr-only — check stdout too
+10. `_call_llm` OpenAI no `timeout=` — hang label/dedup
+
+#### Navigate fast (429)
+
+1. `rg 'call_with_rate_limit_retry|rate_limit' graphify/ tests/`
+2. `graphify/rate_limit.py`
+3. `llm.py`: `_create_chat_completion_with_format_fallback`, `extract_corpus_parallel`, `_extract_with_adaptive_retry` (read-only), `extract_files_direct`, `_call_llm`
+4. `__main__.py` extract env ~4180
+5. `pytest tests/test_rate_limit_retry.py tests/test_llm_backends.py -q`
+
+Not 429: format fallback one-shot drop `response_format`; repair one-shot malformed JSON.
 
 ### Backend kinds
 
@@ -319,10 +438,10 @@ Pass criteria: ≥90% chunks valid JSON without manual repair; no tool/shell loo
 
 ### Navigate fast (no graph.json)
 
-1. `rg 'claude-cli' graphify/ tests/` — full touch surface
-2. Read `graphify/llm.py` `BACKENDS`, `_call_claude_cli`, `_call_codex_cli`, `extract_files_direct`, `_call_llm`, `extract_corpus_parallel`, `detect_backend`
-3. Read `graphify/__main__.py` extract backend auth ~4280
-4. `tests/test_claude_cli_backend.py` — test recipe
+1. `rg 'claude-cli|rate_limit|call_with_rate_limit' graphify/ tests/` — LLM + HTTP retry touch surface
+2. Read `graphify/rate_limit.py` then `graphify/llm.py` `BACKENDS`, `_create_chat_completion_with_format_fallback`, `_call_claude_cli`, `_call_codex_cli`, `extract_files_direct`, `_call_llm`, `extract_corpus_parallel`, `_extract_with_adaptive_retry`, `detect_backend`
+3. Read `graphify/__main__.py` extract backend auth ~4280; rate-limit env ~4180
+4. `tests/test_claude_cli_backend.py` — CLI backend recipe; `tests/test_rate_limit_retry.py` — 429 policy
 5. External: `codex exec --help`, `codex login status` — verify flags before impl
 
 If `graphify-out/graph.json` exists: `graphify query` / wiki index for architecture questions; still use `rg`/ast-index for backend edit sites above.

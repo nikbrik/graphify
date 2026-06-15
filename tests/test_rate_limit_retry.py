@@ -34,6 +34,16 @@ def test_parse_retry_after_seconds_missing():
     assert rate_limit.parse_retry_after_seconds({}) is None
 
 
+def test_parse_retry_after_seconds_case_insensitive():
+    assert rate_limit.parse_retry_after_seconds({"Retry-After": "45"}) == 45.0
+    assert rate_limit.parse_retry_after_seconds({"RETRY-AFTER": "30"}) == 30.0
+
+
+def test_parse_retry_after_ignores_non_retry_after_headers():
+    # x-ratelimit-reset-requests is not a Retry-After seconds value.
+    assert rate_limit.parse_retry_after_seconds({"x-ratelimit-reset-requests": "6m0s"}) is None
+
+
 def test_parse_retry_after_from_body():
     exc = FakeRateLimitError()
     exc.body = {"error": {"retry_after": 90}}
@@ -135,8 +145,94 @@ def test_call_with_rate_limit_retry_exhausted_raises():
             rate_limit.call_with_rate_limit_retry(fn, config=cfg)
 
 
+def test_is_retryable_llm_error_400_not_retryable():
+    exc = Exception("capacity planning error")
+    exc.status_code = 400
+    assert not rate_limit.is_retryable_llm_error(exc)
+
+
+def test_sleep_with_heartbeat_waits_for_extended_gate(monkeypatch):
+    """Local delay may elapse while the global gate is still active — keep waiting."""
+    clock = {"t": 0.0}
+    rate_limit._GATE._paused_until = 0.0
+
+    def monotonic():
+        return clock["t"]
+
+    def fake_sleep(seconds):
+        clock["t"] += seconds
+        if clock["t"] == 1.0:
+            # Another worker hit rate limit with a longer Retry-After.
+            rate_limit._GATE.signal_pause(5.0)
+
+    monkeypatch.setattr(rate_limit.time, "monotonic", monotonic)
+    monkeypatch.setattr(rate_limit.time, "sleep", fake_sleep)
+
+    rate_limit._sleep_with_heartbeat(2.0, None, "test")
+    assert clock["t"] >= 5.0
+
+
+def test_is_retryable_does_not_match_status_substrings_in_unrelated_text():
+    assert not rate_limit.is_retryable_llm_error(Exception("connection to port 5020 refused"))
+    assert rate_limit.is_retryable_llm_error(Exception("Error code: 429 - rate limit"))
+
+
+def test_sleep_with_heartbeat_returns_elapsed_seconds(monkeypatch):
+    clock = {"t": 0.0}
+    rate_limit._GATE._paused_until = 0.0
+
+    def monotonic():
+        return clock["t"]
+
+    def fake_sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(rate_limit.time, "monotonic", monotonic)
+    monkeypatch.setattr(rate_limit.time, "sleep", fake_sleep)
+
+    elapsed = rate_limit._sleep_with_heartbeat(3.0, None, "test")
+    assert elapsed == 3.0
+
+
+def test_call_with_rate_limit_retry_counts_actual_extended_wait(monkeypatch):
+    """max_total_wait must reflect real sleep time, not just planned delay."""
+    clock = {"t": 0.0}
+    rate_limit._GATE._paused_until = 0.0
+
+    def monotonic():
+        return clock["t"]
+
+    def fake_sleep(seconds):
+        clock["t"] += seconds
+        if clock["t"] == 1.0:
+            rate_limit._GATE.signal_pause(4.0)
+
+    def fn():
+        raise rate_limit.SubprocessRateLimitError("429")
+
+    monkeypatch.setattr(rate_limit.time, "monotonic", monotonic)
+    monkeypatch.setattr(rate_limit.time, "sleep", fake_sleep)
+
+    cfg = rate_limit.RateLimitConfig(
+        max_wait_per_attempt=10.0,
+        max_total_wait=3.0,
+        max_retries=5,
+        backoff_base=2.0,
+        backoff_multiplier=2.0,
+    )
+    stats = rate_limit.RateLimitCallStats()
+    with patch("graphify.rate_limit.random.uniform", return_value=1.0):
+        with pytest.raises(rate_limit.SubprocessRateLimitError):
+            rate_limit.call_with_rate_limit_retry(fn, config=cfg, stats=stats)
+
+    assert stats.retries == 1
+    assert stats.wait_seconds >= 5.0
+    assert clock["t"] >= 5.0
+
+
 def test_is_subprocess_rate_limit_error():
     assert rate_limit.is_subprocess_rate_limit_error("HTTP 429 too many requests", 1)
+    assert rate_limit.is_subprocess_rate_limit_error("", 1, stdout="rate limit exceeded")
     assert not rate_limit.is_subprocess_rate_limit_error("auth failed", 1)
 
 

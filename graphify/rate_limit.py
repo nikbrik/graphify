@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -105,6 +106,10 @@ class _RateLimitGate:
                 time.monotonic() + delay_seconds,
             )
 
+    def remaining_pause_seconds(self) -> float:
+        with self._lock:
+            return max(0.0, self._paused_until - time.monotonic())
+
 
 _GATE = _RateLimitGate()
 
@@ -174,7 +179,7 @@ _RETRYABLE_MARKERS = (
     "overloaded",
     "capacity",
 )
-_NON_RETRYABLE_STATUS = frozenset({401, 403, 404})
+_NON_RETRYABLE_STATUS = frozenset({400, 401, 403, 404})
 _TIMEOUT_MARKERS = ("timeout", "timed out", "read timeout", "connect timeout")
 
 
@@ -282,8 +287,10 @@ def _sdk_retryable(exc: BaseException) -> bool:
 
         if isinstance(exc, (RateLimitError, APITimeoutError)):
             return True
-        if isinstance(exc, APIStatusError) and exc.status_code in _RETRYABLE_STATUS:
-            return True
+        if isinstance(exc, APIStatusError):
+            if exc.status_code in _NON_RETRYABLE_STATUS:
+                return False
+            return exc.status_code in _RETRYABLE_STATUS
     except ImportError:
         pass
     try:
@@ -294,6 +301,10 @@ def _sdk_retryable(exc: BaseException) -> bool:
     except ImportError:
         pass
     return False
+
+
+def _message_indicates_http_status(msg: str, code: int) -> bool:
+    return re.search(rf"\b{code}\b", msg) is not None
 
 
 def is_retryable_llm_error(exc: BaseException, *, is_context_overflow: Callable[[BaseException], bool] | None = None) -> bool:
@@ -318,7 +329,7 @@ def is_retryable_llm_error(exc: BaseException, *, is_context_overflow: Callable[
     msg = str(exc).lower()
     if any(m in msg for m in _RETRYABLE_MARKERS):
         return True
-    if "429" in msg or "503" in msg or "502" in msg or "504" in msg:
+    if any(_message_indicates_http_status(msg, code) for code in (429, 502, 503, 504)):
         return True
 
     response = getattr(exc, "response", None)
@@ -370,19 +381,22 @@ def _format_context(ctx: RateLimitContext | None, backend: str) -> str:
     return ", ".join(parts)
 
 
-def _sleep_with_heartbeat(delay: float, ctx: RateLimitContext | None, backend: str) -> None:
+def _sleep_with_heartbeat(delay: float, ctx: RateLimitContext | None, backend: str) -> float:
+    """Sleep up to ``delay`` seconds while honouring the global gate; return elapsed time."""
     if delay <= 0:
-        return
-    deadline = time.monotonic() + delay
+        return 0.0
+    start = time.monotonic()
+    deadline = start + delay
     heartbeat_interval = 60.0
-    next_heartbeat = time.monotonic() + heartbeat_interval if delay > 120 else deadline + 1
+    next_heartbeat = start + heartbeat_interval if delay > 120 else deadline + 1
 
     while True:
-        _GATE.wait_if_paused()
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        # Honour both this worker's delay and any longer global gate set by peers.
+        remaining = max(deadline - now, _GATE.remaining_pause_seconds())
         if remaining <= 0:
-            return
-        if time.monotonic() >= next_heartbeat and delay > 120:
+            return now - start
+        if now >= next_heartbeat and delay > 120:
             ctx_str = _format_context(ctx, backend)
             print(
                 f"[graphify] still waiting on rate limit ({ctx_str}); "
@@ -390,7 +404,7 @@ def _sleep_with_heartbeat(delay: float, ctx: RateLimitContext | None, backend: s
                 file=sys.stderr,
                 flush=True,
             )
-            next_heartbeat = time.monotonic() + heartbeat_interval
+            next_heartbeat = now + heartbeat_interval
         time.sleep(min(remaining, 1.0))
 
 
@@ -452,12 +466,12 @@ def call_with_rate_limit_retry(
             )
 
             _GATE.signal_pause(delay)
-            _sleep_with_heartbeat(delay, ctx, backend)
+            actual_wait = _sleep_with_heartbeat(delay, ctx, backend)
 
-            total_waited += delay
+            total_waited += actual_wait
             local_stats.retries += 1
-            local_stats.wait_seconds += delay
-            _record_global_retry(delay)
+            local_stats.wait_seconds += actual_wait
+            _record_global_retry(actual_wait)
             attempt += 1
 
 
@@ -465,9 +479,13 @@ class SubprocessRateLimitError(RuntimeError):
     """Raised when a CLI subprocess stderr indicates rate limiting."""
 
 
-def is_subprocess_rate_limit_error(stderr: str, returncode: int) -> bool:
+def is_subprocess_rate_limit_error(
+    stderr: str,
+    returncode: int,
+    stdout: str = "",
+) -> bool:
     """Best-effort detection of rate limit in CLI subprocess output."""
     if returncode == 0:
         return False
-    text = (stderr or "").lower()
+    text = f"{stderr or ''}\n{stdout or ''}".lower()
     return any(m in text for m in _RETRYABLE_MARKERS) or "429" in text
