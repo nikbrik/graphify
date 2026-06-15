@@ -233,7 +233,55 @@ def test_call_with_rate_limit_retry_counts_actual_extended_wait(monkeypatch):
 def test_is_subprocess_rate_limit_error():
     assert rate_limit.is_subprocess_rate_limit_error("HTTP 429 too many requests", 1)
     assert rate_limit.is_subprocess_rate_limit_error("", 1, stdout="rate limit exceeded")
+    assert rate_limit.is_subprocess_rate_limit_error("503 service unavailable", 1)
     assert not rate_limit.is_subprocess_rate_limit_error("auth failed", 1)
+    assert not rate_limit.is_subprocess_rate_limit_error("error near line 4290", 1)
+
+
+def test_gate_pause_increment_deduplicates_overlapping_workers():
+    """Global wait must not sum concurrent pauses from parallel workers."""
+    rate_limit._GATE._paused_until = 0.0
+    first = rate_limit._GATE.signal_pause(10.0)
+    second = rate_limit._GATE.signal_pause(10.0)
+    assert first == 10.0
+    assert second == 0.0
+    extended = rate_limit._GATE.signal_pause(15.0)
+    assert extended == 5.0
+
+
+def test_global_wait_uses_deduplicated_gate_increment(monkeypatch):
+    rate_limit.reset_global_rate_limit_stats()
+    rate_limit._GATE._paused_until = 0.0
+    clock = {"t": 0.0}
+
+    def monotonic():
+        return clock["t"]
+
+    def fake_sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(rate_limit.time, "monotonic", monotonic)
+    monkeypatch.setattr(rate_limit.time, "sleep", fake_sleep)
+
+    cfg = rate_limit.RateLimitConfig(
+        max_wait_per_attempt=10.0,
+        max_total_wait=30.0,
+        max_retries=1,
+        backoff_base=10.0,
+        backoff_multiplier=2.0,
+    )
+
+    def fn():
+        raise FakeRateLimitError(headers={"retry-after": "10"})
+
+    with patch("graphify.rate_limit.random.uniform", return_value=1.0):
+        with pytest.raises(FakeRateLimitError):
+            rate_limit.call_with_rate_limit_retry(fn, config=cfg)
+
+    stats = rate_limit.snapshot_global_rate_limit_stats()
+    assert stats["retries"] == 1
+    assert stats["wait_seconds"] == 10.0
+    assert clock["t"] == 10.0
 
 
 def test_resolve_rate_limit_config_from_env(monkeypatch):
@@ -264,3 +312,43 @@ def test_global_stats_recorded_on_retry():
     stats = rate_limit.snapshot_global_rate_limit_stats()
     assert stats["retries"] == 1
     assert stats["wait_seconds"] > 0
+
+
+def test_thread_stats_isolated_between_workers():
+    """Parallel chunk workers must not count each other's retries."""
+    import threading
+
+    rate_limit.reset_global_rate_limit_stats()
+    barrier = threading.Barrier(2)
+    results: dict[str, int] = {}
+
+    def worker(name: str, fail_times: int):
+        rate_limit.reset_thread_rate_limit_stats()
+        barrier.wait()
+        calls = {"n": 0}
+
+        def fn():
+            calls["n"] += 1
+            if calls["n"] <= fail_times:
+                raise FakeRateLimitError(headers={"retry-after": "0.01"})
+            return name
+
+        cfg = rate_limit.RateLimitConfig(
+            max_wait_per_attempt=1.0,
+            max_total_wait=10.0,
+            backoff_base=0.01,
+        )
+        with patch("graphify.rate_limit.time.sleep"):
+            rate_limit.call_with_rate_limit_retry(fn, config=cfg)
+        results[name] = rate_limit.snapshot_thread_rate_limit_stats().retries
+
+    t1 = threading.Thread(target=worker, args=("a", 1))
+    t2 = threading.Thread(target=worker, args=("b", 2))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert results["a"] == 1
+    assert results["b"] == 2
+    assert rate_limit.snapshot_global_rate_limit_stats()["retries"] == 3

@@ -23,8 +23,10 @@ from graphify.rate_limit import (
     call_with_rate_limit_retry,
     is_subprocess_rate_limit_error,
     reset_global_rate_limit_stats,
+    reset_thread_rate_limit_stats,
     set_rate_limit_context,
     snapshot_global_rate_limit_stats,
+    snapshot_thread_rate_limit_stats,
 )
 
 # `_read_files` truncates each file at this many characters before joining into
@@ -2500,11 +2502,10 @@ def extract_corpus_parallel(
 
     def _run_one(idx: int, chunk: list[Path]) -> tuple[int, dict | None, Exception | None, int]:
         t0 = time.time()
-        before = snapshot_global_rate_limit_stats()
+        reset_thread_rate_limit_stats()
         prev_ctx = set_rate_limit_context(
             RateLimitContext(chunk_idx=idx, chunk_total=total, backend=backend)
         )
-        chunk_retries = 0
         try:
             result = _extract_with_adaptive_retry(
                 chunk,
@@ -2516,8 +2517,7 @@ def extract_corpus_parallel(
                 deep_mode=deep_mode,
             )
             result["elapsed_seconds"] = round(time.time() - t0, 2)
-            after = snapshot_global_rate_limit_stats()
-            chunk_retries = int(after["retries"]) - int(before["retries"])
+            chunk_retries = snapshot_thread_rate_limit_stats().retries
             return idx, result, None, chunk_retries
         except Exception as exc:  # noqa: BLE001 — caller-facing surface, log + continue
             return idx, None, exc, 0

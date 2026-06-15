@@ -82,6 +82,27 @@ def get_rate_limit_context() -> RateLimitContext | None:
     return getattr(_tls, "context", None)
 
 
+def reset_thread_rate_limit_stats() -> None:
+    """Clear per-thread retry counters (start of each parallel chunk worker)."""
+    _tls.stats = RateLimitCallStats()
+
+
+def snapshot_thread_rate_limit_stats() -> RateLimitCallStats:
+    stats = getattr(_tls, "stats", None)
+    if stats is None:
+        return RateLimitCallStats()
+    return RateLimitCallStats(retries=stats.retries, wait_seconds=stats.wait_seconds)
+
+
+def _record_thread_retry(wait_seconds: float) -> None:
+    stats = getattr(_tls, "stats", None)
+    if stats is None:
+        stats = RateLimitCallStats()
+        _tls.stats = stats
+    stats.retries += 1
+    stats.wait_seconds += wait_seconds
+
+
 class _RateLimitGate:
     """Global pause shared across parallel chunk workers."""
 
@@ -97,14 +118,17 @@ class _RateLimitGate:
                 return
             time.sleep(min(remaining, 1.0))
 
-    def signal_pause(self, delay_seconds: float) -> None:
+    def signal_pause(self, delay_seconds: float) -> float:
+        """Extend global pause; return newly added seconds (deduped for metrics)."""
         if delay_seconds <= 0:
-            return
+            return 0.0
         with self._lock:
-            self._paused_until = max(
-                self._paused_until,
-                time.monotonic() + delay_seconds,
-            )
+            now = time.monotonic()
+            prev_effective = max(self._paused_until, now)
+            new_until = max(self._paused_until, now + delay_seconds)
+            increment = new_until - prev_effective
+            self._paused_until = new_until
+        return increment
 
     def remaining_pause_seconds(self) -> float:
         with self._lock:
@@ -465,13 +489,14 @@ def call_with_rate_limit_retry(
                 flush=True,
             )
 
-            _GATE.signal_pause(delay)
+            pause_increment = _GATE.signal_pause(delay)
             actual_wait = _sleep_with_heartbeat(delay, ctx, backend)
 
             total_waited += actual_wait
             local_stats.retries += 1
             local_stats.wait_seconds += actual_wait
-            _record_global_retry(actual_wait)
+            _record_global_retry(pause_increment)
+            _record_thread_retry(actual_wait)
             attempt += 1
 
 
@@ -488,4 +513,6 @@ def is_subprocess_rate_limit_error(
     if returncode == 0:
         return False
     text = f"{stderr or ''}\n{stdout or ''}".lower()
-    return any(m in text for m in _RETRYABLE_MARKERS) or "429" in text
+    if any(m in text for m in _RETRYABLE_MARKERS):
+        return True
+    return any(_message_indicates_http_status(text, code) for code in _RETRYABLE_STATUS)
