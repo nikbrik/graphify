@@ -169,6 +169,15 @@ def test_exception_status_code_from_boto_response_metadata():
     assert rate_limit._exception_status_code(exc) == 503
 
 
+def test_is_retryable_llm_error_bedrock_throttling_400():
+    exc = Exception("bedrock request failed")
+    exc.response = {
+        "Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"},
+        "ResponseMetadata": {"HTTPStatusCode": 400},
+    }
+    assert rate_limit.is_retryable_llm_error(exc)
+
+
 def test_sleep_with_heartbeat_waits_for_extended_gate(monkeypatch):
     """Local delay may elapse while the global gate is still active — keep waiting."""
     clock = {"t": 0.0}

@@ -367,6 +367,18 @@ def is_retryable_llm_error(exc: BaseException, *, is_context_overflow: Callable[
     if code == 400 and _is_explicit_rate_limit_message(exc):
         return True
 
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        err = response.get("Error", {})
+        err_code = str(err.get("Code", ""))
+        if err_code in (
+            "ThrottlingException",
+            "TooManyRequestsException",
+            "ServiceUnavailable",
+            "RequestLimitExceeded",
+        ):
+            return True
+
     if _sdk_retryable(exc):
         return True
 
@@ -385,18 +397,6 @@ def is_retryable_llm_error(exc: BaseException, *, is_context_overflow: Callable[
         return True
     if any(_message_indicates_http_status(msg, code) for code in (429, 502, 503, 504)):
         return True
-
-    response = getattr(exc, "response", None)
-    if isinstance(response, dict):
-        err = response.get("Error", {})
-        code = str(err.get("Code", ""))
-        if code in (
-            "ThrottlingException",
-            "TooManyRequestsException",
-            "ServiceUnavailable",
-            "RequestLimitExceeded",
-        ):
-            return True
 
     if _looks_like_timeout(exc):
         return True
